@@ -362,6 +362,33 @@ class AddiVortesRegressor:
         """
         return traceplots(self, ask=ask, axes=axes, show=show, **kwargs)
 
+    def trace_diagnostics(
+        self,
+        *,
+        plot_types: tuple[str, ...] | None = None,
+        stats: tuple[str, ...] | None = None,
+        lag_k: int = 50,
+        ask: bool = False,
+        axes=None,
+        show: bool = False,
+        **kwargs,
+    ):
+        """Create MCMC trace diagnostics for a fitted model.
+
+        The diagnostics include trace plots, histograms, and autocorrelation
+        summaries for selected trace statistics.
+        """
+        return trace_diagnostics(
+            self,
+            plot_types=plot_types,
+            stats=stats,
+            lag_k=lag_k,
+            ask=ask,
+            axes=axes,
+            show=show,
+            **kwargs,
+        )
+
     def summary(self) -> dict[str, Any]:
         """Return a dictionary of fitted model summary information."""
 
@@ -709,6 +736,280 @@ def traceplots(
     return axes_list
 
 
+_TRACE_DIAGNOSTIC_STATS = (
+    ("average_centres_per_tessellation", "Average Number of Tessellation Centres"),
+    ("average_dimensions_per_tessellation", "Average Number of Dimensions"),
+    ("log_likelihood", "Log Likelihood"),
+)
+
+
+def trace_diagnostics(
+    model: AddiVortesRegressor,
+    *,
+    plot_types: tuple[str, ...] | None = None,
+    stats: tuple[str, ...] | None = None,
+    lag_k: int = 50,
+    ask: bool = False,
+    axes=None,
+    show: bool = False,
+    **kwargs,
+):
+    """Create MCMC trace diagnostics for a fitted :class:`AddiVortesRegressor`."""
+
+    if not isinstance(model, AddiVortesRegressor):
+        raise TypeError("model must be an AddiVortesRegressor instance.")
+
+    model._check_is_fitted()
+    if model.trace_stats_ is None:
+        raise RuntimeError(
+            "The fitted model does not contain trace statistics. Refit with a current package version."
+        )
+
+    plot_types = tuple(plot_types) if plot_types is not None else ("trace", "histogram", "autocorrelation")
+    if not plot_types:
+        raise ValueError("plot_types must contain at least one diagnostic type.")
+
+    normalized_plot_types: list[str] = []
+    for plot_type in plot_types:
+        plot_type = str(plot_type).lower()
+        if plot_type not in {"trace", "histogram", "autocorrelation"}:
+            raise ValueError(
+                "plot_types may only contain 'trace', 'histogram', or 'autocorrelation'."
+            )
+        if plot_type not in normalized_plot_types:
+            normalized_plot_types.append(plot_type)
+
+    stats = tuple(stats) if stats is not None else tuple(item[0] for item in _TRACE_DIAGNOSTIC_STATS)
+    normalized_stats: list[tuple[str, str]] = []
+    valid_stats = dict(_TRACE_DIAGNOSTIC_STATS)
+    for stat in stats:
+        stat = str(stat)
+        if stat not in valid_stats:
+            raise ValueError(
+                f"stats may only contain {sorted(valid_stats)}. Got {stat!r}."
+            )
+        if stat not in [field for field, _ in normalized_stats]:
+            normalized_stats.append((stat, valid_stats[stat]))
+
+    trace_stats = model.trace_stats_
+    plt = _matplotlib_pyplot()
+    sequential_show = bool(show)
+    axes_list: list = []
+    if not sequential_show:
+        axes_list = _plot_axes(plt, axes, len(normalized_stats) * len(normalized_plot_types))
+
+    plot_index = 0
+    for stat, label in normalized_stats:
+        values = getattr(trace_stats, stat)
+        post_burn_in_values = _post_burn_in_values(trace_stats, values)
+
+        # Compute and print effective sample size for this statistic
+        try:
+            ess = _effective_sample_size(post_burn_in_values, lag_k)
+            print(f"Effective sample size ({label}): {ess:.1f}")
+        except Exception:
+            # If ESS computation fails for any reason, continue without
+            # interrupting plotting.
+            pass
+
+        for plot_type in normalized_plot_types:
+            if ask:
+                input(f"Press [Enter] to see {plot_type} for {label}: ")
+
+            if sequential_show:
+                # plt.subplots may return (fig, ax) where ax can be an
+                # Axes instance or an array/list. Normalize to a single
+                # Axes object for consistent downstream plotting.
+                sub_result = plt.subplots(1, 1)
+                if isinstance(sub_result, tuple) and len(sub_result) == 2:
+                    figure, raw_axis = sub_result
+                else:
+                    # Some backends or mocks may return only the axes
+                    figure = None
+                    raw_axis = sub_result
+
+                if isinstance(raw_axis, (list, tuple, np.ndarray)):
+                    raw_axis_arr = np.asarray(raw_axis, dtype=object).ravel()
+                    axis = raw_axis_arr[0]
+                else:
+                    axis = raw_axis
+            else:
+                axis = axes_list[plot_index]
+
+            if plot_type == "trace":
+                _plot_burn_in_trace(
+                    axis,
+                    trace_stats,
+                    values,
+                    ylab=label,
+                    main=f"MCMC Trace: {label}",
+                    color="darkblue",
+                    legend_digits=2,
+                    **kwargs,
+                )
+            elif plot_type == "histogram":
+                _plot_histogram(
+                    axis,
+                    post_burn_in_values,
+                    xlab=label,
+                    main=f"Density: {label}",
+                    color="darkblue",
+                    **kwargs,
+                )
+            else:
+                _plot_autocorrelation(
+                    axis,
+                    post_burn_in_values,
+                    lag_k=lag_k,
+                    xlab="Lag",
+                    ylab="Autocorrelation",
+                    main=f"Autocorrelation (lag {lag_k}): {label}",
+                    color="darkblue",
+                    **kwargs,
+                )
+
+            if sequential_show:
+                # If the caller requested interactive prompting via `ask`, the
+                # earlier `input()` call has already waited. Otherwise prompt
+                # the user before showing each plot so graphs appear one at a
+                # time.
+                if not ask:
+                    try:
+                        input(f"Press [Enter] to see {plot_type} for {label}: ")
+                    except Exception:
+                        pass
+                if figure is not None and hasattr(figure, "tight_layout"):
+                    figure.tight_layout()
+                try:
+                    plt.show(block=True)
+                except TypeError:
+                    try:
+                        plt.show()
+                    except Exception:
+                        pass
+                axes_list.append(axis)
+
+            plot_index += 1
+
+    figure = axes_list[0].figure if axes_list else None
+    if not sequential_show:
+        if figure is not None and hasattr(figure, "tight_layout"):
+            figure.tight_layout()
+        if show:
+            plt.show()
+
+    return axes_list
+
+
+def _post_burn_in_values(trace_stats: TraceStats, values: np.ndarray) -> np.ndarray:
+    burn_in_mask = np.asarray(trace_stats.is_burn_in, dtype=bool)
+    post_burn_in = values[~burn_in_mask]
+    return post_burn_in if post_burn_in.size > 0 else values
+
+
+def _autocorrelation(values: np.ndarray, lag: int) -> float:
+    values = np.asarray(values, dtype=float)
+    if lag == 0:
+        return 1.0
+
+    n = values.size
+    if lag >= n:
+        return float("nan")
+
+    centered = values - values.mean()
+    front = centered[:-lag]
+    back = centered[lag:]
+    denom = np.std(front, ddof=0) * np.std(back, ddof=0)
+    if denom == 0.0:
+        return 0.0
+    return float(np.dot(front, back) / ((n - lag) * denom))
+
+
+def _effective_sample_size(values: np.ndarray, max_lag: int) -> float:
+    """Estimate effective sample size (ESS) for a univariate MCMC trace.
+
+    Uses the standard estimator ESS = n / (1 + 2 * sum_{k=1..K} rho_k) where
+    rho_k are autocorrelations up to the first non-positive lag or up to
+    ``max_lag`` (whichever comes first).
+    """
+    vals = np.asarray(values, dtype=float)
+    n = vals.size
+    if n <= 1:
+        return float(n)
+
+    L = min(int(max_lag), n - 1)
+    rhos = []
+    for k in range(1, L + 1):
+        rho = _autocorrelation(vals, k)
+        if np.isnan(rho):
+            break
+        rhos.append(rho)
+        if rho <= 0.0:
+            break
+
+    sum_rho = float(np.sum(rhos)) if rhos else 0.0
+    denom = 1.0 + 2.0 * sum_rho
+    if denom <= 0:
+        return float(n)
+    return float(n) / denom
+
+
+def _plot_histogram(axis, values: np.ndarray, *, xlab: str, main: str, color: str, **kwargs) -> None:
+    values = np.asarray(values, dtype=float)
+    plot_kwargs = {"color": color, "linewidth": 1.5}
+    plot_kwargs.update(kwargs)
+
+    if values.size <= 1 or np.all(values == values[0]):
+        center = float(values[0]) if values.size == 1 else 0.0
+        xs = np.asarray([center - 0.5, center, center + 0.5], dtype=float)
+        ys = np.asarray([0.0, 1.0, 0.0], dtype=float)
+    else:
+        kde = stats.gaussian_kde(values)
+        xs = np.linspace(np.min(values), np.max(values), 200)
+        ys = kde(xs)
+
+    axis.plot(xs, ys, **plot_kwargs)
+    if hasattr(axis, "fill_between"):
+        axis.fill_between(xs, ys, color=color, alpha=0.3)
+    axis.set(xlabel=xlab, ylabel="Density", title=main)
+    axis.axhline(0.0, color="gray", linestyle=":", linewidth=1.0)
+
+
+def _plot_autocorrelation(
+    axis,
+    values: np.ndarray,
+    *,
+    lag_k: int,
+    xlab: str,
+    ylab: str,
+    main: str,
+    color: str,
+    **kwargs,
+) -> None:
+    # Always show autocorrelation for lags 0..50
+    lags = np.arange(0, 51)
+    corr = np.asarray([_autocorrelation(values, int(lag)) for lag in lags], dtype=float)
+    line_kwargs = {"color": color, "marker": "o", "linewidth": 1.5}
+    line_kwargs.update(kwargs)
+    axis.plot(lags, corr, **line_kwargs)
+    axis.axhline(0.0, color="gray", linestyle=":", linewidth=1.0)
+    axis.set(xlabel=xlab, ylabel=ylab, title=main)
+
+    # Prefer integer tick labels at 0,10,20,30,40,50. Use set_xticks/set_xticklabels
+    # when available; fall back to axis.set(...) so unit tests with FakeAxis
+    # continue to record the intended ticks.
+    ticks = np.arange(0, 51, 10)
+    labels = [str(int(t)) for t in ticks]
+    try:
+        axis.set_xticks(ticks)
+        axis.set_xticklabels(labels)
+    except Exception:
+        try:
+            axis.set(xticks=list(ticks), xticklabels=labels)
+        except Exception:
+            pass
+
+
 def _trace_stats_from_result(trace_stats: dict[str, Any]) -> TraceStats:
     return TraceStats(
         iteration=np.asarray(trace_stats["iteration"], dtype=int),
@@ -834,7 +1135,8 @@ def _plot_axes(plt, axes, n_plots: int) -> list:
     elif n_plots == 2:
         rows, cols = 1, 2
     else:
-        rows, cols = 2, 2
+        cols = 2
+        rows = (n_plots + cols - 1) // cols
 
     _, axes_array = plt.subplots(rows, cols, squeeze=False)
     axes_list = list(np.asarray(axes_array, dtype=object).ravel())

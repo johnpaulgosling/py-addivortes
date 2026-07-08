@@ -26,6 +26,8 @@ Step-by-step walkthroughs are available in the documentation:
   regression with train/test evaluation.
 - [Bayesian regression and prediction](tutorials/prediction.md): synthetic data
   with known structure and credible intervals.
+- [Convergence diagnostics and trace analysis](tutorials/convergence.md): effective
+  sample size, autocorrelation, and density-based trace diagnostics.
 - [Modelling spherical data](tutorials/spherical.md): great-circle distance,
   mixed metrics, and multiple spherical surfaces.
 - [Using categorical covariates](tutorials/categorical.md): one-hot encoding,

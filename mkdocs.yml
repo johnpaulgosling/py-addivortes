@@ -18,6 +18,7 @@ nav:
   - Tutorials:
       - Machine learning with AddiVortes: tutorials/introduction.md
       - Bayesian regression and prediction: tutorials/prediction.md
+      - Convergence diagnostics and trace analysis: tutorials/convergence.md
       - Modelling spherical data: tutorials/spherical.md
       - Using categorical covariates: tutorials/categorical.md
   - API reference: api.md
