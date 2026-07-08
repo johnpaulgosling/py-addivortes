@@ -3,7 +3,7 @@ import types
 import numpy as np
 import pytest
 
-from addivortes import AddiVortesRegressor, traceplots
+from addivortes import AddiVortesRegressor, traceplots, trace_diagnostics
 from conftest import fast_model, regression_data
 
 
@@ -18,11 +18,17 @@ class FakeAxis(types.SimpleNamespace):
     def plot(self, *args, **kwargs):
         self.calls.append(("plot", args, kwargs))
 
+    def hist(self, *args, **kwargs):
+        self.calls.append(("hist", args, kwargs))
+
     def axvline(self, *args, **kwargs):
         self.calls.append(("axvline", args, kwargs))
 
     def axhline(self, *args, **kwargs):
         self.calls.append(("axhline", args, kwargs))
+
+    def fill_between(self, *args, **kwargs):
+        self.calls.append(("fill_between", args, kwargs))
 
     def text(self, *args, **kwargs):
         self.calls.append(("text", args, kwargs))
@@ -91,3 +97,18 @@ def test_traceplots_prompts_when_ask_true(fake_pyplot, monkeypatch):
 
     assert len(prompts) == 4
     assert "average centres" in prompts[0]
+
+
+def test_trace_diagnostics_creates_expected_plots(fake_pyplot):
+    x, y = regression_data(seed=7, n_obs=10, n_features=2)
+    model = fast_model(total_mcmc_iter=10, burn_in=3, thinning=1)
+    model.fit(x, y)
+
+    axes = model.trace_diagnostics(show=True, plot_types=("trace", "histogram", "autocorrelation"))
+
+    assert len(axes) == 9
+    assert fake_pyplot.show_called
+    assert any(call[0] == "plot" for axis in axes for call in axis.calls)
+    assert any(call[0] == "fill_between" for axis in axes for call in axis.calls)
+    assert not any(call[0] == "hist" for axis in axes for call in axis.calls)
+    assert any(call[0] == "set" for axis in axes for call in axis.calls)
