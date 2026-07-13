@@ -123,6 +123,22 @@ Create four MCMC trace plots recorded at every iteration:
 This method does not require training data. It uses `trace_stats_`, which is
 populated during `fit`.
 
+#### `trace_diagnostics(*, plot_types=None, stats=None, lag_k=50, ask=False, axes=None, show=False, **kwargs)`
+
+Create detailed MCMC diagnostics for a fitted model.
+
+- `plot_types` may include any combination of `"trace"`, `"histogram"`, and
+  `"autocorrelation"`.
+- `stats` may include `"average_centres_per_tessellation"`,
+  `"average_dimensions_per_tessellation"`, and `"log_likelihood"`.
+- `lag_k` controls the maximum lag for autocorrelation summaries and defaults to
+  50.
+- When `show=True`, the diagnostics display sequentially and prompt before
+  showing each plot when `ask=True`.
+
+This method prints an estimate of effective sample size for each statistic and
+returns the matplotlib axes used for the requested plots.
+
 #### `summary()`
 
 Return a dictionary with fitted-model summary information, including:
