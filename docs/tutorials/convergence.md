@@ -42,7 +42,7 @@ This creates three types of plots for each diagnostic statistic:
 
 - `trace`: the full MCMC trace and burn-in boundary
 - `histogram`: a kernel density estimate of post-burn-in samples
-- `autocorrelation`: the lag autocorrelation sequence up to 50
+- `autocorrelation`: the lag autocorrelation sequence up to 250
 
 ### What to look for
 
@@ -50,7 +50,7 @@ This creates three types of plots for each diagnostic statistic:
   range rather than drifting.
 - **Reasonable effective sample size**: AddiVortes prints the estimated
   effective sample size (ESS) for each trace statistic.
-- **Low autocorrelation**: autocorrelation should decay toward zero by lag 50.
+- **Low autocorrelation**: autocorrelation should decay toward zero by lag 250.
 
 ## 3. Understanding the output
 
@@ -58,7 +58,7 @@ This creates three types of plots for each diagnostic statistic:
 
 - `average_centres_per_tessellation`
 - `average_dimensions_per_tessellation`
-- `log_likelihood`
+- `sigma`
 
 These are the same trace statistics used by `model.traceplots()` plus the
 log-likelihood trace, and they help diagnose whether the posterior sampler has
@@ -81,13 +81,13 @@ You can restrict diagnostics to a subset of plot types or statistics:
 ```python
 model.trace_diagnostics(
     plot_types=("autocorrelation",),
-    stats=("log_likelihood",),
-    lag_k=50,
+    stats=("sigma",),
+    lag_k=250,
     show=True,
 )
 ```
 
-This only draws the selected diagnostics and uses a maximum lag of 50 for the
+This only draws the selected diagnostics and uses a maximum lag of 250 for the
 autocorrelation summary.
 
 ## 6. Link to the API reference

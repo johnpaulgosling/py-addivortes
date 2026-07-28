@@ -367,7 +367,7 @@ class AddiVortesRegressor:
         *,
         plot_types: tuple[str, ...] | None = None,
         stats: tuple[str, ...] | None = None,
-        lag_k: int = 50,
+        lag_k: int = 250,
         ask: bool = False,
         axes=None,
         show: bool = False,
@@ -993,9 +993,9 @@ def _plot_autocorrelation(
     **kwargs,
 ) -> None:
     # Always show autocorrelation for lags 0..50
-    lags = np.arange(0, 51)
+    lags = np.arange(0, lag_k + 1)
     corr = np.asarray([_autocorrelation(values, int(lag)) for lag in lags], dtype=float)
-    line_kwargs = {"color": color, "marker": "o", "linewidth": 1.5}
+    line_kwargs = {"color": color, "linewidth": 1.5}
     line_kwargs.update(kwargs)
     axis.plot(lags, corr, **line_kwargs)
     axis.axhline(0.0, color="gray", linestyle=":", linewidth=1.0)
@@ -1004,7 +1004,7 @@ def _plot_autocorrelation(
     # Prefer integer tick labels at 0,10,20,30,40,50. Use set_xticks/set_xticklabels
     # when available; fall back to axis.set(...) so unit tests with FakeAxis
     # continue to record the intended ticks.
-    ticks = np.arange(0, 51, 10)
+    ticks = np.arange(0, lag_k + 1, 10)
     labels = [str(int(t)) for t in ticks]
     try:
         axis.set_xticks(ticks)
