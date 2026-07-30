@@ -40,7 +40,7 @@ def main() -> None:
         "lambda_value": 0.05,
         "sigma_squared_mu": 0.01,
         "omega": 2.0,
-        "lambda_rate": 25.0,
+        "lambda_rate": 5.0,
         "cat_scaling": 1.0,
         "seed": 424242,
     }

@@ -209,6 +209,86 @@ double tessellation_log_likelihood_component(const std::vector<double>& r_cell,
   return -0.5 * sum_log + (sigma_squared_mu / (2.0 * sigma_squared)) * sum_r;
 }
 
+double selection_prob(const std::string& modification, int b, int d, int p) {
+  if (modification == "AD") {
+    if (d == p) {
+      return 0.0;
+    }
+    return (d == 1) ? 0.4 : 0.2;
+  }
+  if (modification == "RD") {
+    if (d <= 1) {
+      return 0.0;
+    }
+    return (d == p) ? 0.4 : 0.2;
+  }
+  if (modification == "AC") {
+    return (b == 1) ? 0.4 : 0.2;
+  }
+  if (modification == "RC") {
+    return (b > 1) ? 0.2 : 0.0;
+  }
+  if (modification == "Change") {
+    return (d == p) ? 0.2 : 0.1;
+  }
+  if (modification == "Swap") {
+    return (d < p) ? 0.1 : 0.0;
+  }
+  return 0.0;
+}
+
+std::string reverse_modification(const std::string& modification) {
+  if (modification == "AD") {
+    return "RD";
+  }
+  if (modification == "RD") {
+    return "AD";
+  }
+  if (modification == "AC") {
+    return "RC";
+  }
+  if (modification == "RC") {
+    return "AC";
+  }
+  return modification;
+}
+
+double log_structure_and_selection(int d_new,
+                                   int n_centres_new,
+                                   double sigma_squared,
+                                   double omega,
+                                   double lambda_rate,
+                                   int p,
+                                   const std::string& modification) {
+  double acc = 0.0;
+  int b_old = n_centres_new;
+  int d_old = d_new;
+
+  if (modification == "AD") {
+    d_old = d_new - 1;
+    acc += std::log(static_cast<double>(p - d_old)) - std::log(static_cast<double>(d_old)) +
+           std::log(omega) - std::log(static_cast<double>(p) - omega);
+  } else if (modification == "RD") {
+    d_old = d_new + 1;
+    acc += std::log(static_cast<double>(d_old - 1)) - std::log(static_cast<double>(p - d_old + 1)) +
+           std::log(static_cast<double>(p) - omega) - std::log(omega);
+  } else if (modification == "AC") {
+    b_old = n_centres_new - 1;
+    acc += std::log(lambda_rate) - std::log(static_cast<double>(b_old)) + 0.5 * std::log(sigma_squared);
+  } else if (modification == "RC") {
+    b_old = n_centres_new + 1;
+    acc += std::log(static_cast<double>(b_old - 1)) - std::log(lambda_rate) - 0.5 * std::log(sigma_squared);
+  } else {
+    return acc;
+  }
+
+  const std::string reverse = reverse_modification(modification);
+  const double q_forward = selection_prob(modification, b_old, d_old, p);
+  const double q_reverse = selection_prob(reverse, n_centres_new, d_new, p);
+  acc += std::log(q_reverse) - std::log(q_forward);
+  return acc;
+}
+
 double log_acceptance_components(const std::vector<double>& r_old,
                                  const std::vector<int>& n_old,
                                  const std::vector<double>& r_new,
@@ -225,35 +305,9 @@ double log_acceptance_components(const std::vector<double>& r_old,
       tessellation_log_likelihood_component(r_old, n_old, sigma_squared, sigma_squared_mu);
   const double new_log_lik =
       tessellation_log_likelihood_component(r_new, n_new, sigma_squared, sigma_squared_mu);
-  double acc = new_log_lik - old_log_lik;
-
-  if (modification == "AD") {
-    acc += 2.0 * std::log(static_cast<double>(p - d_new + 1)) -
-           std::log(static_cast<double>(d_new - 1)) - std::log(static_cast<double>(d_new)) +
-           std::log(omega) - std::log(static_cast<double>(p) - omega);
-    if (d_new == 2) {
-      acc -= std::log(2.0);
-    }
-  } else if (modification == "RD") {
-    acc += std::log(static_cast<double>(d_new + 1)) + std::log(static_cast<double>(d_new)) -
-           2.0 * std::log(static_cast<double>(p - d_new)) + std::log(static_cast<double>(p) - omega) -
-           std::log(omega);
-    if (d_new == p - 1) {
-      acc -= std::log(2.0);
-    }
-  } else if (modification == "AC") {
-    acc += std::log(lambda_rate) - std::log(static_cast<double>(n_centres_new)) -
-           std::log(static_cast<double>(n_centres_new - 1)) + 0.5 * std::log(sigma_squared);
-    if (n_centres_new == 2) {
-      acc -= std::log(2.0);
-    }
-  } else if (modification == "RC") {
-    acc += std::log(static_cast<double>(n_centres_new + 1)) +
-           std::log(static_cast<double>(n_centres_new)) - std::log(lambda_rate) -
-           0.5 * std::log(sigma_squared);
-  }
-
-  return acc;
+  return new_log_lik - old_log_lik +
+         log_structure_and_selection(
+             d_new, n_centres_new, sigma_squared, omega, lambda_rate, p, modification);
 }
 
 std::vector<double> sample_mu(const std::vector<double>& r_cell,
@@ -294,14 +348,6 @@ ProposalResult propose_internal(const std::vector<double>& tess,
   auto sample_global_coordinate = [&](int global_dim) {
     double value = proposal_mu[global_dim] + normal(rng) * proposal_sd[global_dim];
     if (metric[global_dim] == 1 && is_last_member_column(global_dim, members)) {
-      value = period_shift(value, kPi);
-    }
-    return value;
-  };
-
-  auto sample_local_coordinate = [&](int local_idx) {
-    double value = proposal_mu[local_idx] + normal(rng) * proposal_sd[local_idx];
-    if (metric[local_idx] == 1 && is_last_member_column(local_idx, members)) {
       value = period_shift(value, kPi);
     }
     return value;
@@ -349,7 +395,7 @@ ProposalResult propose_internal(const std::vector<double>& tess,
       }
     }
     for (int col = 0; col < d; ++col) {
-      result.tess[n_centres * d + col] = sample_local_coordinate(col);
+      result.tess[n_centres * d + col] = sample_global_coordinate(result.dim[col]);
     }
   } else if (choice < 0.8 && n_centres > 1) {
     result.modification = "RC";
@@ -369,7 +415,7 @@ ProposalResult propose_internal(const std::vector<double>& tess,
     std::uniform_int_distribution<int> centre_dist(0, n_centres - 1);
     const int centre = centre_dist(rng);
     for (int col = 0; col < d; ++col) {
-      result.tess[centre * d + col] = sample_local_coordinate(col);
+      result.tess[centre * d + col] = sample_global_coordinate(result.dim[col]);
     }
   } else {
     result.modification = "Swap";
@@ -382,7 +428,7 @@ ProposalResult propose_internal(const std::vector<double>& tess,
     } while (in_vector(new_dim, result.dim));
     result.dim[local_dim] = new_dim;
     for (int row = 0; row < n_centres; ++row) {
-      result.tess[row * d + local_dim] = sample_local_coordinate(local_dim);
+      result.tess[row * d + local_dim] = sample_global_coordinate(new_dim);
     }
   }
 
@@ -836,4 +882,14 @@ PYBIND11_MODULE(_core, m) {
         py::arg("cat_scaling"), py::arg("seed"), py::arg("verbose"));
   m.def("cell_indices", &cell_indices, py::arg("query"), py::arg("centres"), py::arg("dim"),
         py::arg("metric_red"), py::arg("member_red"));
+  m.def(
+      "log_acceptance_structure",
+      &log_structure_and_selection,
+      py::arg("d_new"),
+      py::arg("n_centres_new"),
+      py::arg("sigma_squared"),
+      py::arg("omega"),
+      py::arg("lambda_rate"),
+      py::arg("p"),
+      py::arg("modification"));
 }

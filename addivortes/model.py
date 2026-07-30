@@ -60,7 +60,7 @@ class AddiVortesRegressor:
         q: float = 0.85,
         k: int = 3,
         omega: float | None = None,
-        lambda_rate: float = 25.0,
+        lambda_rate: float = 5.0,
         initial_sigma: str = "linear",
         metric: str | list[str] = "euclidean",
         members: list[int] | np.ndarray | None = None,

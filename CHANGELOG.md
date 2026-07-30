@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Fixed structural-move acceptance ratios so cell-count and covariate-count
+  priors match the published model (extra birth penalty, doubled covariate pick
+  ratio, and missing boundary selection adjustments).
+- Fixed proposal draws for add-centre, change, and swap so centre coordinates
+  use each selected covariate's own proposal settings.
+- Changed the default `lambda_rate` from 25 to 5 so typical cell counts stay
+  aligned with the corrected cell-count prior.
+
 ## 0.6.6
 
 - Added in more tests to check that in-sample and out-of-sample predictions align (especially in the spherical case with permuted variables).

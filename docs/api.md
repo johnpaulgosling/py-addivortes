@@ -21,7 +21,7 @@ AddiVortesRegressor(
     q=0.85,
     k=3,
     omega=None,
-    lambda_rate=25.0,
+    lambda_rate=5.0,
     initial_sigma="linear",
     metric="euclidean",
     members=None,

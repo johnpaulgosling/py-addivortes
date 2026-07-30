@@ -42,7 +42,7 @@ model = AddiVortesRegressor(
     q=0.85,
     k=3,
     omega=3,
-    lambda_rate=25,
+    lambda_rate=5,
     initial_sigma="linear", # R: InitialSigma = "Linear"
     random_state=1025,
     verbose=False,
