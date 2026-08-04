@@ -54,10 +54,24 @@ def test_prepare_design_encodes_character_categorical_columns():
 
     assert design.columns == ("x1", "group_b", "group_c")
     assert design.encoding is not None
+    assert design.encoding.one_hot is True
     assert design.encoding.cat_col_indices == (1,)
     assert design.encoding.levels[1] == ("a", "b", "c")
     assert design.encoding.encoded_binary_cols == (1, 2)
     np.testing.assert_allclose(design.values, [[0.0, 2.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 2.0]])
+
+
+def test_prepare_design_native_categorical_codes_without_onehot():
+    frame = pd.DataFrame({"x1": [0.0, 1.0, 2.0], "group": ["b", "a", "c"]})
+
+    design = prepare_design(frame, metric="euclidean", cat_onehot=False)
+
+    assert design.columns == ("x1", "group")
+    assert design.encoding is not None
+    assert design.encoding.one_hot is False
+    assert design.encoding.encoded_binary_cols == ()
+    np.testing.assert_array_equal(design.metric, [0, 2])
+    np.testing.assert_allclose(design.values[:, 1], [2.0, 1.0, 3.0])
 
 
 def test_prepare_design_reuses_encoding_and_maps_unseen_levels_to_reference():

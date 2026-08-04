@@ -18,6 +18,7 @@ class CategoryEncoding:
     original_columns: tuple[str, ...]
     encoded_columns: tuple[str, ...]
     encoded_binary_cols: tuple[int, ...]
+    one_hot: bool = True
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,8 @@ class DesignMatrix:
     members: np.ndarray
     columns: tuple[str, ...]
     encoding: CategoryEncoding | None
+    source_metric: tuple[str, ...]
+    source_members: np.ndarray
 
 
 def as_dataframe(x, *, column_prefix: str = "x") -> pd.DataFrame:
@@ -79,6 +82,7 @@ def prepare_design(
     members=None,
     cat_scaling: float = 1.0,
     encoding: CategoryEncoding | None = None,
+    cat_onehot: bool = True,
 ) -> DesignMatrix:
     if cat_scaling <= 0:
         raise ValueError("cat_scaling must be positive.")
@@ -93,13 +97,19 @@ def prepare_design(
             frame.columns = list(encoding.original_columns)
             original_columns = tuple(encoding.original_columns)
         cat_scaling = encoding.cat_scaling
+        cat_onehot = encoding.one_hot
 
     metric_labels = normalize_metric(metric, frame.shape[1])
     metric_labels = [
         "C" if label == "E" and _is_categorical(frame.iloc[:, idx]) else label
         for idx, label in enumerate(metric_labels)
     ]
+    # Infer membership from the post-detection metric labels when the caller did
+    # not supply members. This keeps native categorical columns (metric C) in a
+    # separate membership group from Euclidean columns.
     member_labels = normalize_members(members, metric_labels)
+    if members is not None:
+        member_labels = _ensure_categorical_membership(member_labels, metric_labels)
 
     categorical_cols = _categorical_columns(frame, metric_labels, encoding)
     result_cols: list[np.ndarray] = []
@@ -118,12 +128,22 @@ def prepare_design(
                 levels[col_idx] = encoding.levels[col_idx]
 
             values = col.astype("string").fillna("<NA>").astype(str)
-            for level in levels[col_idx][1:]:
-                result_cols.append((values == level).to_numpy(dtype=float) * cat_scaling)
-                result_names.append(f"{col_name}_{level}")
-                result_metric.append(METRIC_TO_INT["E"])
+            if cat_onehot:
+                for level in levels[col_idx][1:]:
+                    result_cols.append((values == level).to_numpy(dtype=float) * cat_scaling)
+                    result_names.append(f"{col_name}_{level}")
+                    result_metric.append(METRIC_TO_INT["E"])
+                    result_members.append(int(member_labels[col_idx]))
+                    binary_cols.append(len(result_cols) - 1)
+            else:
+                # 1-based integer codes matching R's as.numeric(factor(...)).
+                # Unseen levels map to the reference level (code 1).
+                level_to_code = {level: idx + 1 for idx, level in enumerate(levels[col_idx])}
+                codes = np.asarray([level_to_code.get(value, 1) for value in values], dtype=float)
+                result_cols.append(codes)
+                result_names.append(col_name)
+                result_metric.append(METRIC_TO_INT["C"])
                 result_members.append(int(member_labels[col_idx]))
-                binary_cols.append(len(result_cols) - 1)
         else:
             try:
                 numeric = pd.to_numeric(col, errors="raise").to_numpy(dtype=float)
@@ -150,6 +170,7 @@ def prepare_design(
             original_columns=original_columns,
             encoded_columns=tuple(result_names),
             encoded_binary_cols=tuple(binary_cols),
+            one_hot=bool(cat_onehot),
         )
 
     return DesignMatrix(
@@ -158,7 +179,30 @@ def prepare_design(
         members=np.asarray(result_members, dtype=np.int32),
         columns=tuple(result_names),
         encoding=built_encoding,
+        source_metric=tuple(metric_labels),
+        source_members=np.asarray(member_labels, dtype=np.int32),
     )
+
+
+def category_counts(metric: np.ndarray, values: np.ndarray) -> np.ndarray:
+    """Return per-column category counts for metric==2 columns (1-based max code)."""
+
+    metric = np.asarray(metric, dtype=np.int32)
+    values = np.asarray(values, dtype=float)
+    if values.ndim != 2:
+        raise ValueError("values must be a 2D array.")
+    if metric.size != values.shape[1]:
+        raise ValueError("metric length must match the number of columns in values.")
+
+    counts: list[int] = []
+    for col in range(values.shape[1]):
+        if metric[col] != 2:
+            continue
+        max_code = int(np.max(values[:, col])) if values.shape[0] else 0
+        if max_code <= 0:
+            raise ValueError("Categorical columns must use positive integer codes.")
+        counts.append(max_code)
+    return np.asarray(counts, dtype=np.int32)
 
 
 def scale_vector(y) -> tuple[np.ndarray, float, float]:
@@ -209,6 +253,30 @@ def reduced_metric_and_members(metric: np.ndarray, members: np.ndarray) -> tuple
         idx += count
 
     return np.asarray(reduced_metric, dtype=np.int32), np.asarray(member_counts, dtype=np.int32)
+
+
+def _ensure_categorical_membership(members: np.ndarray, metric: list[str]) -> np.ndarray:
+    """Ensure categorical columns do not share membership with non-categoricals."""
+
+    out = np.asarray(members, dtype=np.int32).copy()
+    cat_idx = [idx for idx, label in enumerate(metric) if label == "C"]
+    if not cat_idx:
+        return out
+
+    non_cat_members = {int(out[idx]) for idx, label in enumerate(metric) if label != "C"}
+    if not non_cat_members.intersection(int(out[idx]) for idx in cat_idx):
+        return out
+
+    next_member = int(out.max()) + 1 if out.size else 1
+    remapped: dict[int, int] = {}
+    for idx in cat_idx:
+        current = int(out[idx])
+        if current in non_cat_members:
+            if current not in remapped:
+                remapped[current] = next_member
+                next_member += 1
+            out[idx] = remapped[current]
+    return out
 
 
 def _normalize_one_metric(value) -> str:

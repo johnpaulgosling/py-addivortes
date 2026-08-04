@@ -95,11 +95,41 @@ double spherical_distance(const std::vector<double>& first,
   return angle_diff * angle_diff;
 }
 
+// Eskin distance (Eskin et al., 2002): for each mismatched category add 2 / n_c^2.
+double categorical_distance(const std::vector<double>& first,
+                            const std::vector<double>& second,
+                            int offset,
+                            int size,
+                            const std::vector<int>& ncats,
+                            int cat_offset) {
+  if (cat_offset + size > static_cast<int>(ncats.size())) {
+    throw std::invalid_argument("Categorical group size exceeds ncats length.");
+  }
+  double total = 0.0;
+  for (int idx = 0; idx < size; ++idx) {
+    const double left = first[offset + idx];
+    const double right = second[offset + idx];
+    if (std::floor(left) != left || std::floor(right) != right) {
+      throw std::invalid_argument("Categorical coordinates must be integer-valued.");
+    }
+    if (left != right) {
+      const double n_cat = static_cast<double>(ncats[cat_offset + idx]);
+      if (n_cat <= 0.0) {
+        throw std::invalid_argument("ncats entries must be positive.");
+      }
+      total += 2.0 / (n_cat * n_cat);
+    }
+  }
+  return total;
+}
+
 double calc_distance(const std::vector<double>& first,
                      const std::vector<double>& second,
                      const std::vector<int>& member_counts,
-                     const std::vector<int>& metric) {
+                     const std::vector<int>& metric,
+                     const std::vector<int>& ncats) {
   int offset = 0;
+  int cat_offset = 0;
   double total = 0.0;
   for (int group = 0; group < static_cast<int>(member_counts.size()); ++group) {
     const int size = member_counts[group];
@@ -107,10 +137,53 @@ double calc_distance(const std::vector<double>& first,
       total += euclidean_distance(first, second, offset, size);
     } else if (metric[group] == 1) {
       total += spherical_distance(first, second, offset, size);
+    } else if (metric[group] == 2) {
+      total += categorical_distance(first, second, offset, size, ncats, cat_offset);
+      cat_offset += size;
+    } else {
+      throw std::invalid_argument("Unsupported metric type in distance calculation.");
     }
     offset += size;
   }
   return total;
+}
+
+int categorical_index_for_column(int global_dim, const std::vector<int>& metric) {
+  int cat_idx = 0;
+  for (int idx = 0; idx < static_cast<int>(metric.size()); ++idx) {
+    if (metric[idx] != 2) {
+      continue;
+    }
+    if (idx == global_dim) {
+      return cat_idx;
+    }
+    ++cat_idx;
+  }
+  throw std::invalid_argument("Requested categorical index for a non-categorical column.");
+}
+
+std::vector<int> compute_ncats_from_data(const double* x,
+                                         int n,
+                                         int p,
+                                         const std::vector<int>& metric) {
+  std::vector<int> ncats;
+  for (int col = 0; col < p; ++col) {
+    if (metric[col] != 2) {
+      continue;
+    }
+    int max_val = 0;
+    for (int row = 0; row < n; ++row) {
+      const double value = x[row * p + col];
+      if (value > static_cast<double>(max_val)) {
+        max_val = static_cast<int>(std::llround(value));
+      }
+    }
+    if (max_val <= 0) {
+      throw std::invalid_argument("Categorical columns must use positive integer codes.");
+    }
+    ncats.push_back(max_val);
+  }
+  return ncats;
 }
 
 ReducedMetric make_reduced_metric(const std::vector<int>& metric, const std::vector<int>& members) {
@@ -141,7 +214,8 @@ std::vector<int> knn1_internal(const double* x,
                                int d,
                                const std::vector<int>& dim,
                                const std::vector<int>& metric_red,
-                               const std::vector<int>& member_red) {
+                               const std::vector<int>& member_red,
+                               const std::vector<int>& ncats) {
   std::vector<int> result(n, 0);
   if (n_centres == 1) {
     return result;
@@ -161,7 +235,7 @@ std::vector<int> knn1_internal(const double* x,
       for (int local_dim = 0; local_dim < d; ++local_dim) {
         tess_point[dim[local_dim]] = centres[centre * d + local_dim];
       }
-      const double distance = calc_distance(query_point, tess_point, member_red, metric_red);
+      const double distance = calc_distance(query_point, tess_point, member_red, metric_red, ncats);
       if (distance < best_distance) {
         best_distance = distance;
         best_centre = centre;
@@ -335,6 +409,7 @@ ProposalResult propose_internal(const std::vector<double>& tess,
                                 const std::vector<double>& proposal_mu,
                                 const std::vector<int>& metric,
                                 const std::vector<int>& members,
+                                const std::vector<int>& ncats,
                                 std::mt19937_64& rng) {
   ProposalResult result;
   result.tess = tess;
@@ -346,6 +421,14 @@ ProposalResult propose_internal(const std::vector<double>& tess,
   std::normal_distribution<double> normal(0.0, 1.0);
 
   auto sample_global_coordinate = [&](int global_dim) {
+    if (metric[global_dim] == 2) {
+      const int cat_idx = categorical_index_for_column(global_dim, metric);
+      if (cat_idx < 0 || cat_idx >= static_cast<int>(ncats.size()) || ncats[cat_idx] <= 0) {
+        throw std::invalid_argument("Invalid categorical level count for proposal.");
+      }
+      std::uniform_int_distribution<int> cat_dist(1, ncats[cat_idx]);
+      return static_cast<double>(cat_dist(rng));
+    }
     double value = proposal_mu[global_dim] + normal(rng) * proposal_sd[global_dim];
     if (metric[global_dim] == 1 && is_last_member_column(global_dim, members)) {
       value = period_shift(value, kPi);
@@ -553,6 +636,7 @@ py::dict run_mcmc(py::array_t<double, py::array::c_style | py::array::forcecast>
   std::vector<double> proposal_mu = copy_double_array(proposal_mu_arr, 1);
   std::vector<int> binary_cols = copy_int_array(binary_cols_arr);
   const ReducedMetric reduced = make_reduced_metric(metric, members);
+  const std::vector<int> ncats = compute_ncats_from_data(x_scaled, n, p, metric);
 
   if (static_cast<int>(metric.size()) != p || static_cast<int>(members.size()) != p ||
       static_cast<int>(proposal_sd.size()) != p || static_cast<int>(proposal_mu.size()) != p) {
@@ -595,7 +679,8 @@ py::dict run_mcmc(py::array_t<double, py::array::c_style | py::array::forcecast>
         tess_dim_count[idx],
         dim[idx],
         reduced.metric,
-        reduced.member_counts);
+        reduced.member_counts,
+        ncats);
     for (int obs = 0; obs < n; ++obs) {
       sum_all_tess[obs] += pred[idx][current_indices[idx][obs]];
     }
@@ -659,6 +744,7 @@ py::dict run_mcmc(py::array_t<double, py::array::c_style | py::array::forcecast>
           proposal_mu,
           metric,
           members,
+          ncats,
           rng);
 
       if (!binary_cols.empty()) {
@@ -683,7 +769,8 @@ py::dict run_mcmc(py::array_t<double, py::array::c_style | py::array::forcecast>
           static_cast<int>(proposal.dim.size()),
           proposal.dim,
           reduced.metric,
-          reduced.member_counts);
+          reduced.member_counts,
+          ncats);
 
       std::vector<double> r_old;
       std::vector<double> r_new;
@@ -842,7 +929,8 @@ py::array_t<int> cell_indices(py::array_t<double, py::array::c_style | py::array
                               py::array_t<double, py::array::c_style | py::array::forcecast> centres_arr,
                               py::array_t<int, py::array::c_style | py::array::forcecast> dim_arr,
                               py::array_t<int, py::array::c_style | py::array::forcecast> metric_red_arr,
-                              py::array_t<int, py::array::c_style | py::array::forcecast> member_red_arr) {
+                              py::array_t<int, py::array::c_style | py::array::forcecast> member_red_arr,
+                              py::object ncats_obj = py::none()) {
   py::buffer_info query_info = query_arr.request();
   py::buffer_info centres_info = centres_arr.request();
   if (query_info.ndim != 2 || centres_info.ndim != 2) {
@@ -868,7 +956,32 @@ py::array_t<int> cell_indices(py::array_t<double, py::array::c_style | py::array
     throw std::invalid_argument("member_red must sum to query column count.");
   }
 
-  const std::vector<int> indices = knn1_internal(query, n, p, centres, n_centres, d, dim, metric_red, member_red);
+  std::vector<int> ncats;
+  if (ncats_obj.is_none()) {
+    // Expand reduced metric to per-column codes so category counts can be derived
+    // from the query matrix when the caller does not pass them explicitly.
+    std::vector<int> metric_full;
+    metric_full.reserve(p);
+    for (int group = 0; group < static_cast<int>(metric_red.size()); ++group) {
+      metric_full.insert(metric_full.end(), member_red[group], metric_red[group]);
+    }
+    ncats = compute_ncats_from_data(query, n, p, metric_full);
+  } else {
+    ncats = copy_int_array(ncats_obj);
+  }
+
+  int expected_cats = 0;
+  for (int group = 0; group < static_cast<int>(metric_red.size()); ++group) {
+    if (metric_red[group] == 2) {
+      expected_cats += member_red[group];
+    }
+  }
+  if (static_cast<int>(ncats.size()) != expected_cats) {
+    throw std::invalid_argument("ncats length must match the number of categorical columns.");
+  }
+
+  const std::vector<int> indices =
+      knn1_internal(query, n, p, centres, n_centres, d, dim, metric_red, member_red, ncats);
   return make_int_vector(indices);
 }
 
@@ -880,8 +993,14 @@ PYBIND11_MODULE(_core, m) {
         py::arg("omega"), py::arg("lambda_rate"), py::arg("proposal_sd"), py::arg("proposal_mu"),
         py::arg("init_tess"), py::arg("init_dim"), py::arg("init_pred"), py::arg("binary_cols"),
         py::arg("cat_scaling"), py::arg("seed"), py::arg("verbose"));
-  m.def("cell_indices", &cell_indices, py::arg("query"), py::arg("centres"), py::arg("dim"),
-        py::arg("metric_red"), py::arg("member_red"));
+  m.def("cell_indices",
+        &cell_indices,
+        py::arg("query"),
+        py::arg("centres"),
+        py::arg("dim"),
+        py::arg("metric_red"),
+        py::arg("member_red"),
+        py::arg("ncats") = py::none());
   m.def(
       "log_acceptance_structure",
       &log_structure_and_selection,

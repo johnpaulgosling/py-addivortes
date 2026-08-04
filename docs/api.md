@@ -26,6 +26,7 @@ AddiVortesRegressor(
     metric="euclidean",
     members=None,
     cat_scaling=1.0,
+    cat_onehot=True,
     random_state=None,
     verbose=False,
 )
@@ -74,10 +75,14 @@ integer per column indicating surface membership, for example
 
 #### Categorical covariates
 
-String, object, and pandas `Categorical` columns are one-hot encoded
-automatically. Use `cat_scaling` to control the weight of categorical
-differences relative to continuous covariates. See
-[Using categorical covariates](tutorials/categorical.md).
+String, object, and pandas `Categorical` columns are handled automatically.
+
+- `cat_onehot=True` (default): one-hot encode categories as Euclidean binary
+  columns. Use `cat_scaling` to control their distance weight.
+- `cat_onehot=False`: keep each categorical column as an integer-coded native
+  categorical metric and use Eskin distance.
+
+See [Using categorical covariates](tutorials/categorical.md).
 
 #### `fit_predict(X, y, **predict_kwargs)`
 

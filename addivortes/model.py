@@ -12,7 +12,7 @@ from . import _core
 from .preprocessing import (
     CategoryEncoding,
     apply_scaling,
-    normalize_members,
+    category_counts,
     normalize_metric,
     prepare_design,
     reduced_metric_and_members,
@@ -65,6 +65,7 @@ class AddiVortesRegressor:
         metric: str | list[str] = "euclidean",
         members: list[int] | np.ndarray | None = None,
         cat_scaling: float = 1.0,
+        cat_onehot: bool = True,
         random_state: int | None = None,
         verbose: bool = False,
     ) -> None:
@@ -81,6 +82,7 @@ class AddiVortesRegressor:
         self.metric = metric
         self.members = members
         self.cat_scaling = cat_scaling
+        self.cat_onehot = cat_onehot
         self.random_state = random_state
         self.verbose = verbose
 
@@ -91,12 +93,12 @@ class AddiVortesRegressor:
 
         raw_columns = np.asarray(X).shape[1] if np.asarray(X).ndim == 2 else 1
         metric_labels = normalize_metric(self.metric, raw_columns)
-        original_members = normalize_members(self.members, metric_labels)
         design = prepare_design(
             X,
             metric=metric_labels,
-            members=original_members,
+            members=self.members,
             cat_scaling=float(self.cat_scaling),
+            cat_onehot=bool(self.cat_onehot),
         )
         y_scaled, y_centre, y_range = scale_vector(y)
 
@@ -131,14 +133,16 @@ class AddiVortesRegressor:
             metric=design.metric,
             members=design.members,
             encoding=design.encoding,
+            x_values=design.values,
         )
 
         binary_cols = (
             np.asarray(design.encoding.encoded_binary_cols, dtype=np.int32)
-            if design.encoding is not None
+            if design.encoding is not None and design.encoding.one_hot
             else np.empty(0, dtype=np.int32)
         )
         seed = int(rng.integers(0, np.iinfo(np.uint64).max, dtype=np.uint64))
+        ncats = category_counts(design.metric, design.values)
 
         result = _core.run_mcmc(
             x_scaled,
@@ -160,7 +164,7 @@ class AddiVortesRegressor:
             init_dim,
             init_pred,
             binary_cols,
-            float(self.cat_scaling),
+            float(self.cat_scaling) if design.encoding is None or design.encoding.one_hot else 0.0,
             seed,
             bool(self.verbose),
         )
@@ -190,9 +194,10 @@ class AddiVortesRegressor:
         self.in_sample_rmse_ = in_sample_rmse
         self.metric_ = design.metric
         self.members_ = design.members
-        self.metric_labels_ = metric_labels
-        self.original_members_ = original_members
+        self.metric_labels_ = list(design.source_metric)
+        self.original_members_ = design.source_members
         self.cat_encoding_: CategoryEncoding | None = design.encoding
+        self.ncats_ = ncats
         self.feature_names_in_ = tuple(design.columns)
         self.n_original_features_in_ = raw_columns
         self.n_features_in_ = n_features
@@ -229,6 +234,7 @@ class AddiVortesRegressor:
             members=self.original_members_,
             cat_scaling=float(self.cat_scaling),
             encoding=self.cat_encoding_,
+            cat_onehot=bool(self.cat_onehot),
         )
         if design.values.shape[1] != self.n_features_in_:
             raise ValueError("X has a different encoded feature count than the fitted model.")
@@ -243,6 +249,9 @@ class AddiVortesRegressor:
 
         rng = np.random.default_rng(self.random_state if random_state is None else random_state)
         prediction_matrix = np.empty((n_obs, n_samples), dtype=float)
+        ncats = getattr(self, "ncats_", None)
+        if ncats is None:
+            ncats = category_counts(self.metric_, design.values)
 
         progress_steps = sum(len(tess_sample) for tess_sample in self.posterior_.tessellations)
         with _ProgressBar("Predict", progress_steps, bool(self.verbose)) as progress:
@@ -259,6 +268,7 @@ class AddiVortesRegressor:
                         np.asarray(dims, dtype=np.int32),
                         self.metric_red_,
                         self.member_red_,
+                        ncats,
                     )
                     sample_pred += np.asarray(cell_pred, dtype=float)[indices]
                     progress.advance()
@@ -423,6 +433,7 @@ class AddiVortesRegressor:
             "metric": self.metric,
             "members": self.members,
             "cat_scaling": self.cat_scaling,
+            "cat_onehot": self.cat_onehot,
             "random_state": self.random_state,
             "verbose": self.verbose,
         }
@@ -500,20 +511,27 @@ class AddiVortesRegressor:
         metric: np.ndarray,
         members: np.ndarray,
         encoding: CategoryEncoding | None,
+        x_values: np.ndarray,
     ) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
         init_tess: list[np.ndarray] = []
         init_dim: list[np.ndarray] = []
         init_pred: list[np.ndarray] = []
-        binary_cols = set(encoding.encoded_binary_cols if encoding is not None else ())
+        binary_cols = set(
+            encoding.encoded_binary_cols if encoding is not None and encoding.one_hot else ()
+        )
 
         for _ in range(int(self.n_tessellations)):
             dim = np.asarray([int(rng.integers(0, n_features))], dtype=np.int32)
             col = dim[0]
-            value = rng.normal(loc=0.0, scale=proposal_sd[col])
-            if metric[col] == 1 and _is_last_member_column(col, members):
-                value = _period_shift(value, np.pi)
-            if col in binary_cols:
-                value = rng.uniform(0.0, float(self.cat_scaling))
+            if metric[col] == 2:
+                unique_codes = np.unique(x_values[:, col])
+                value = float(rng.choice(unique_codes))
+            else:
+                value = rng.normal(loc=0.0, scale=proposal_sd[col])
+                if metric[col] == 1 and _is_last_member_column(col, members):
+                    value = _period_shift(value, np.pi)
+                if col in binary_cols:
+                    value = rng.uniform(0.0, float(self.cat_scaling))
 
             init_dim.append(dim)
             init_tess.append(np.asarray([[value]], dtype=float))
@@ -530,7 +548,7 @@ class AddiVortesRegressor:
     ) -> np.ndarray:
         out = np.asarray(scaled, dtype=float).copy()
         out[:, metric != 0] = original[:, metric != 0]
-        if encoding is not None and encoding.encoded_binary_cols:
+        if encoding is not None and encoding.one_hot and encoding.encoded_binary_cols:
             binary_cols = np.asarray(encoding.encoded_binary_cols, dtype=int)
             out[:, binary_cols] = original[:, binary_cols]
         return np.ascontiguousarray(out, dtype=float)

@@ -75,3 +75,21 @@ def test_invalid_cat_scaling_rejected():
 
     with pytest.raises(ValueError, match="cat_scaling"):
         fast_model(cat_scaling=-1).fit(frame, y)
+
+
+def test_cat_onehot_false_keeps_original_feature_names():
+    frame = pd.DataFrame(
+        {
+            "x1": [0.0, 1.0, 2.0, 3.0] * 6,
+            "group": ["a", "b", "c", "a"] * 6,
+        }
+    )
+    y = np.asarray([0.0, 1.0, -1.0, 0.5] * 6)
+
+    model = fast_model(cat_onehot=False, random_state=5).fit(frame, y)
+
+    assert model.get_params()["cat_onehot"] is False
+    assert model.feature_names_in_ == ("x1", "group")
+    assert model.n_features_in_ == 2
+    assert model.cat_encoding_ is not None
+    assert model.cat_encoding_.one_hot is False
