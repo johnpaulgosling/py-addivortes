@@ -3,8 +3,9 @@
 This tutorial explains how AddiVortes handles **categorical covariates**: variables
 that take a discrete set of named levels, such as region, product type, or
 treatment group. Voronoi tessellations require numerical distances between
-points, so categorical variables are converted automatically using **one-hot
-encoding**.
+points. By default, categorical variables are converted using **one-hot
+encoding**. Set `cat_onehot=False` to keep native categorical columns and use
+**Eskin distance** instead.
 
 ## 1. What is one-hot encoding?
 
@@ -264,18 +265,46 @@ In this example the true response has substantial category effects (up to ±20
 units for product type) relative to the continuous effects, so increasing
 `cat_scaling` may help the model focus more on categorical group membership.
 
-## 9. Summary
+## 9. Native categorical covariates with Eskin distance
+
+Set `cat_onehot=False` to skip one-hot encoding. Each categorical column is
+stored as a single integer-coded covariate (codes `1, …, d`) and distances use
+the Eskin measure: a mismatch on a variable with *d* levels contributes
+`2 / d²`.
+
+```python
+model_eskin = AddiVortesRegressor(
+    n_tessellations=50,
+    total_mcmc_iter=500,
+    burn_in=100,
+    cat_onehot=False,
+    random_state=42,
+    verbose=False,
+)
+model_eskin.fit(x_train, y_train)
+preds_eskin = model_eskin.predict(x_test)
+```
+
+With this option:
+
+- feature names stay as the original column names (no `column_level` expansion);
+- `model.metric_` marks categorical columns with code `2`;
+- `model.ncats_` stores the number of levels per categorical column;
+- unseen levels at prediction time still map to the reference level (code `1`).
+
+## 10. Summary
 
 - Pass string or categorical columns directly in a pandas DataFrame;
   AddiVortes encodes them automatically.
-- **One-hot encoding**: a categorical variable with *d* levels becomes *d − 1*
-  binary indicator columns.
-- The **reference level** is the alphabetically first level; all its indicators
-  are zero.
+- **One-hot encoding** (`cat_onehot=True`, default): a categorical variable with
+  *d* levels becomes *d − 1* binary indicator columns.
+- **Eskin path** (`cat_onehot=False`): keep one integer-coded column per
+  categorical variable and use Eskin distance.
+- The **reference level** is the alphabetically first level; all its one-hot
+  indicators are zero, and unseen levels map to this reference.
 - Indicator columns are named `<original_column>_<level>` (for example
-  `product_Premium`).
-- **`cat_scaling`** (default 1.0) controls the weight of categorical differences
-  relative to continuous differences.
+  `product_Premium`) when one-hot encoding is used.
+- **`cat_scaling`** (default 1.0) controls the weight of one-hot categorical
+  differences relative to continuous differences.
 - Encoding metadata is stored in `model.cat_encoding_` and applied automatically
   in `predict()`.
-- Unseen category levels at prediction time are treated as the reference level.

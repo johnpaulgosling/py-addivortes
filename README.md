@@ -7,7 +7,7 @@ approximation.
 
 The package exposes a Python API backed by a C++20 extension. It supports numpy
 arrays and pandas data frames, including categorical covariates via one-hot
-encoding.
+encoding or native Eskin distance (`cat_onehot=False`).
 
 ## Features
 
