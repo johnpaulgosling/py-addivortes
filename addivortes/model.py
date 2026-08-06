@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import sys
 from typing import Any
 import warnings
 
@@ -242,45 +241,37 @@ class AddiVortesRegressor:
         x_scaled = apply_scaling(design.values, self.x_centres_, self.x_ranges_)
         x_scaled = self._restore_unscaled_columns(x_scaled, design.values, self.metric_, self.cat_encoding_)
 
-        n_obs = x_scaled.shape[0]
         n_samples = len(self.posterior_.tessellations)
         if n_samples == 0:
             raise RuntimeError("The fitted model contains no posterior samples.")
 
-        rng = np.random.default_rng(self.random_state if random_state is None else random_state)
-        prediction_matrix = np.empty((n_obs, n_samples), dtype=float)
         ncats = getattr(self, "ncats_", None)
         if ncats is None:
             ncats = category_counts(self.metric_, design.values)
 
-        progress_steps = sum(len(tess_sample) for tess_sample in self.posterior_.tessellations)
-        with _ProgressBar("Predict", progress_steps, bool(self.verbose)) as progress:
+        prediction_matrix = np.asarray(
+            _core.predict_ensemble(
+                x_scaled,
+                self.posterior_.tessellations,
+                self.posterior_.dimensions,
+                self.posterior_.predictions,
+                self.metric_red_,
+                self.member_red_,
+                ncats,
+                bool(self.verbose),
+            ),
+            dtype=float,
+        )
+
+        if kind == "quantile" and interval == "prediction":
+            rng = np.random.default_rng(self.random_state if random_state is None else random_state)
+            n_obs = prediction_matrix.shape[0]
             for sample_idx in range(n_samples):
-                sample_pred = np.zeros(n_obs, dtype=float)
-                tess_sample = self.posterior_.tessellations[sample_idx]
-                dim_sample = self.posterior_.dimensions[sample_idx]
-                pred_sample = self.posterior_.predictions[sample_idx]
-
-                for tess, dims, cell_pred in zip(tess_sample, dim_sample, pred_sample, strict=True):
-                    indices = _core.cell_indices(
-                        x_scaled,
-                        np.asarray(tess, dtype=float),
-                        np.asarray(dims, dtype=np.int32),
-                        self.metric_red_,
-                        self.member_red_,
-                        ncats,
-                    )
-                    sample_pred += np.asarray(cell_pred, dtype=float)[indices]
-                    progress.advance()
-
-                if kind == "quantile" and interval == "prediction":
-                    sample_pred += rng.normal(
-                        loc=0.0,
-                        scale=float(np.sqrt(self.posterior_.sigma[sample_idx])),
-                        size=n_obs,
-                    )
-
-                prediction_matrix[:, sample_idx] = sample_pred
+                prediction_matrix[:, sample_idx] += rng.normal(
+                    loc=0.0,
+                    scale=float(np.sqrt(self.posterior_.sigma[sample_idx])),
+                    size=n_obs,
+                )
 
         if kind == "response":
             return prediction_matrix.mean(axis=1) * self.y_range_ + self.y_centre_
@@ -366,8 +357,8 @@ class AddiVortesRegressor:
 
         Displays four trace plots recorded at every MCMC iteration:
         average centres per tessellation, the standard deviation of centre
-        counts, average active dimensions per tessellation, and the posterior
-        sigma values. This differs from :meth:`plot` with
+        counts, average active dimensions per tessellation, and the retained
+        log-likelihood component. This differs from :meth:`plot` with
         ``which=3``, which traces posterior thinned samples only.
         """
         return traceplots(self, ask=ask, axes=axes, show=show, **kwargs)
@@ -577,53 +568,6 @@ def _match_choice(value: str, choices: set[str], name: str) -> str:
     return normalized
 
 
-class _ProgressBar:
-    def __init__(self, label: str, total: int, enabled: bool, *, width: int = 30) -> None:
-        self.label = label
-        self.total = int(total)
-        self.enabled = bool(enabled) and self.total > 0
-        self.width = int(width)
-        self.current = 0
-        self._last_rendered = -1
-        self._update_step = max(1, self.total // 100) if self.total > 0 else 1
-        self._finished = False
-
-    def __enter__(self) -> "_ProgressBar":
-        if self.enabled:
-            self._render(0)
-        return self
-
-    def __exit__(self, exc_type, exc, traceback) -> None:
-        del exc, traceback
-        if not self.enabled or self._finished:
-            return
-        if exc_type is None:
-            self._render(self.total)
-        else:
-            sys.stderr.write("\n")
-            sys.stderr.flush()
-
-    def advance(self, step: int = 1) -> None:
-        if not self.enabled:
-            return
-        self.current = min(self.total, self.current + int(step))
-        should_render = self.current == self.total or self.current - self._last_rendered >= self._update_step
-        if should_render:
-            self._render(self.current)
-
-    def _render(self, current: int) -> None:
-        self._last_rendered = current
-        fraction = current / self.total
-        filled = int(round(fraction * self.width))
-        bar = "#" * filled + "-" * (self.width - filled)
-        percent = int(round(fraction * 100))
-        sys.stderr.write(f"\r{self.label} [{bar}] {percent:3d}% ({current}/{self.total})")
-        if current >= self.total:
-            sys.stderr.write("\n")
-            self._finished = True
-        sys.stderr.flush()
-
-
 def plot(
     model: AddiVortesRegressor,
     x_train,
@@ -694,14 +638,14 @@ _TRACEPLOT_SPECS = (
     ("average_centres_per_tessellation", "Average Number of Tessellation Centres", "MCMC Trace: Average Centres", "purple", 1),
     ("sd_centres_per_tessellation", "SD of Tessellation Centres", "MCMC Trace: Centre Count SD", "darkorange", 2),
     ("average_dimensions_per_tessellation", "Average Number of Dimensions", "MCMC Trace: Average Dimensions", "darkblue", 1),
-    ("sigma", "Sigma", "MCMC Trace: Sigma", "darkgreen", 4),
+    ("log_likelihood", "Log Likelihood", "MCMC Trace: Log Likelihood", "darkgreen", 4),
 )
 
 _TRACEPLOT_PROMPTS = (
     "average centres trace plot",
     "centre-count standard deviation trace plot",
     "average dimensions trace plot",
-    "sigma trace plot",
+    "log-likelihood trace plot",
 )
 
 
@@ -736,7 +680,7 @@ def traceplots(
         values = _trace_values_for_plot(model, trace_stats, field)
         _plot_burn_in_trace(
             axis,
-            trace_stats if field != "sigma" else None,
+            trace_stats,
             values,
             ylab=ylab,
             main=main,

@@ -1,3 +1,19 @@
+// Hot-path optimisations aligned with R AddiVortes 0.7.1:
+// 1. Incremental cell reassignment with cached winning distance keys
+// 2. Active-dimension-only Euclidean distance (row-major centres)
+// 3. Specialised all-Euclidean assign path
+// 4. Single-pass residual aggregation reused for MH and mu redraw
+// 5. Preallocated scratch buffers outside the j/iter loops
+// 6. Deferred posterior packaging (compact C++ store, Python lists at end)
+// 7. Same NN kernel + flattened posterior traversal for predict
+// 8. Binary-column masks and precomputed categorical column maps
+//
+// Python adaptations vs R:
+// - Centres are row-major (nC x d): centres[c * d + di]
+// - Dimension indices are 0-based
+// - MH uses selection_prob / log_structure_and_selection
+// - RNG is mt19937_64
+
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -5,6 +21,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -27,17 +44,9 @@ namespace {
 
 constexpr double kPi = 3.141592653589793238462643383279502884;
 
-struct ProposalResult {
-  std::vector<double> tess;
-  int n_centres = 0;
-  std::vector<int> dim;
-  std::string modification = "Change";
-};
-
-struct ReducedMetric {
-  std::vector<int> metric;
-  std::vector<int> member_counts;
-};
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
 
 bool in_vector(int value, const std::vector<int>& values) {
   return std::find(values.begin(), values.end(), value) != values.end();
@@ -63,128 +72,19 @@ double uniform01(std::mt19937_64& rng) {
   return dist(rng);
 }
 
-double euclidean_distance(const std::vector<double>& first,
-                          const std::vector<double>& second,
-                          int offset,
-                          int size) {
-  double total = 0.0;
-  for (int idx = 0; idx < size; ++idx) {
-    const double diff = first[offset + idx] - second[offset + idx];
-    total += diff * diff;
+bool all_euclidean_metric(const std::vector<int>& metric) {
+  for (int m : metric) {
+    if (m != 0) {
+      return false;
+    }
   }
-  return total;
+  return true;
 }
 
-double spherical_distance(const std::vector<double>& first,
-                          const std::vector<double>& second,
-                          int offset,
-                          int size) {
-  if (size == 1) {
-    const double a1 = std::abs(first[offset] - second[offset]);
-    const double a2 = 2.0 * kPi - a1;
-    return std::min(a1, a2) * std::min(a1, a2);
-  }
-
-  double angle_diff = std::cos(first[offset + size - 1] - second[offset + size - 1]);
-  for (int idx = size - 2; idx >= 0; --idx) {
-    double internal = std::sin(first[offset + idx]) * std::sin(second[offset + idx]) +
-                      std::cos(first[offset + idx]) * std::cos(second[offset + idx]) * angle_diff;
-    internal = std::clamp(internal, -1.0, 1.0);
-    angle_diff = (idx == 0) ? std::acos(internal) : internal;
-  }
-  return angle_diff * angle_diff;
-}
-
-// Eskin distance (Eskin et al., 2002): for each mismatched category add 2 / n_c^2.
-double categorical_distance(const std::vector<double>& first,
-                            const std::vector<double>& second,
-                            int offset,
-                            int size,
-                            const std::vector<int>& ncats,
-                            int cat_offset) {
-  if (cat_offset + size > static_cast<int>(ncats.size())) {
-    throw std::invalid_argument("Categorical group size exceeds ncats length.");
-  }
-  double total = 0.0;
-  for (int idx = 0; idx < size; ++idx) {
-    const double left = first[offset + idx];
-    const double right = second[offset + idx];
-    if (std::floor(left) != left || std::floor(right) != right) {
-      throw std::invalid_argument("Categorical coordinates must be integer-valued.");
-    }
-    if (left != right) {
-      const double n_cat = static_cast<double>(ncats[cat_offset + idx]);
-      if (n_cat <= 0.0) {
-        throw std::invalid_argument("ncats entries must be positive.");
-      }
-      total += 2.0 / (n_cat * n_cat);
-    }
-  }
-  return total;
-}
-
-double calc_distance(const std::vector<double>& first,
-                     const std::vector<double>& second,
-                     const std::vector<int>& member_counts,
-                     const std::vector<int>& metric,
-                     const std::vector<int>& ncats) {
-  int offset = 0;
-  int cat_offset = 0;
-  double total = 0.0;
-  for (int group = 0; group < static_cast<int>(member_counts.size()); ++group) {
-    const int size = member_counts[group];
-    if (metric[group] == 0) {
-      total += euclidean_distance(first, second, offset, size);
-    } else if (metric[group] == 1) {
-      total += spherical_distance(first, second, offset, size);
-    } else if (metric[group] == 2) {
-      total += categorical_distance(first, second, offset, size, ncats, cat_offset);
-      cat_offset += size;
-    } else {
-      throw std::invalid_argument("Unsupported metric type in distance calculation.");
-    }
-    offset += size;
-  }
-  return total;
-}
-
-int categorical_index_for_column(int global_dim, const std::vector<int>& metric) {
-  int cat_idx = 0;
-  for (int idx = 0; idx < static_cast<int>(metric.size()); ++idx) {
-    if (metric[idx] != 2) {
-      continue;
-    }
-    if (idx == global_dim) {
-      return cat_idx;
-    }
-    ++cat_idx;
-  }
-  throw std::invalid_argument("Requested categorical index for a non-categorical column.");
-}
-
-std::vector<int> compute_ncats_from_data(const double* x,
-                                         int n,
-                                         int p,
-                                         const std::vector<int>& metric) {
-  std::vector<int> ncats;
-  for (int col = 0; col < p; ++col) {
-    if (metric[col] != 2) {
-      continue;
-    }
-    int max_val = 0;
-    for (int row = 0; row < n; ++row) {
-      const double value = x[row * p + col];
-      if (value > static_cast<double>(max_val)) {
-        max_val = static_cast<int>(std::llround(value));
-      }
-    }
-    if (max_val <= 0) {
-      throw std::invalid_argument("Categorical columns must use positive integer codes.");
-    }
-    ncats.push_back(max_val);
-  }
-  return ncats;
-}
+struct ReducedMetric {
+  std::vector<int> metric;
+  std::vector<int> member_counts;
+};
 
 ReducedMetric make_reduced_metric(const std::vector<int>& metric, const std::vector<int>& members) {
   if (metric.size() != members.size()) {
@@ -206,68 +106,602 @@ ReducedMetric make_reduced_metric(const std::vector<int>& metric, const std::vec
   return reduced;
 }
 
-std::vector<int> knn1_internal(const double* x,
-                               int n,
-                               int p,
-                               const std::vector<double>& centres,
-                               int n_centres,
-                               int d,
-                               const std::vector<int>& dim,
-                               const std::vector<int>& metric_red,
-                               const std::vector<int>& member_red,
-                               const std::vector<int>& ncats) {
-  std::vector<int> result(n, 0);
-  if (n_centres == 1) {
-    return result;
+std::vector<int> compute_ncats_from_data(const double* x,
+                                         int n,
+                                         int p,
+                                         const std::vector<int>& metric) {
+  std::vector<int> ncats;
+  for (int col = 0; col < p; ++col) {
+    if (metric[col] != 2) {
+      continue;
+    }
+    int max_val = 0;
+    for (int row = 0; row < n; ++row) {
+      const double value = x[static_cast<size_t>(row) * p + col];
+      if (value > static_cast<double>(max_val)) {
+        max_val = static_cast<int>(std::llround(value));
+      }
+    }
+    if (max_val <= 0) {
+      throw std::invalid_argument("Categorical columns must use positive integer codes.");
+    }
+    ncats.push_back(max_val);
+  }
+  return ncats;
+}
+
+// ---------------------------------------------------------------------------
+// Distance kernels
+// ---------------------------------------------------------------------------
+
+double euclidean_distance(const double* first, const double* second, int size) {
+  double total = 0.0;
+  for (int idx = 0; idx < size; ++idx) {
+    const double diff = first[idx] - second[idx];
+    total += diff * diff;
+  }
+  return total;
+}
+
+double spherical_distance(const double* first, const double* second, int size) {
+  if (size == 1) {
+    const double a1 = std::abs(first[0] - second[0]);
+    const double a2 = 2.0 * kPi - a1;
+    return std::min(a1, a2) * std::min(a1, a2);
   }
 
-  std::vector<double> query_point(p);
-  std::vector<double> tess_point(p);
+  double angle_diff = std::cos(first[size - 1] - second[size - 1]);
+  for (int idx = size - 2; idx >= 0; --idx) {
+    double internal = std::sin(first[idx]) * std::sin(second[idx]) +
+                      std::cos(first[idx]) * std::cos(second[idx]) * angle_diff;
+    internal = std::clamp(internal, -1.0, 1.0);
+    angle_diff = (idx == 0) ? std::acos(internal) : internal;
+  }
+  return angle_diff * angle_diff;
+}
+
+// Eskin distance (Eskin et al., 2002): for each mismatched category add 2 / n_c^2.
+double categorical_distance(const double* first,
+                            const double* second,
+                            int size,
+                            const std::vector<int>& ncats,
+                            int cat_offset) {
+  if (cat_offset + size > static_cast<int>(ncats.size())) {
+    throw std::invalid_argument("Categorical group size exceeds ncats length.");
+  }
+  double total = 0.0;
+  for (int idx = 0; idx < size; ++idx) {
+    const double left = first[idx];
+    const double right = second[idx];
+    if (std::floor(left) != left || std::floor(right) != right) {
+      throw std::invalid_argument("Categorical coordinates must be integer-valued.");
+    }
+    if (left != right) {
+      const double n_cat = static_cast<double>(ncats[cat_offset + idx]);
+      if (n_cat <= 0.0) {
+        throw std::invalid_argument("ncats entries must be positive.");
+      }
+      total += 2.0 / (n_cat * n_cat);
+    }
+  }
+  return total;
+}
+
+double calc_distance(const double* first,
+                     const double* second,
+                     int /*p*/,
+                     const std::vector<int>& member_counts,
+                     const std::vector<int>& metric,
+                     const std::vector<int>& ncats) {
+  int offset = 0;
+  int cat_offset = 0;
+  double total = 0.0;
+  for (int group = 0; group < static_cast<int>(member_counts.size()); ++group) {
+    const int size = member_counts[group];
+    if (metric[group] == 0) {
+      total += euclidean_distance(first + offset, second + offset, size);
+    } else if (metric[group] == 1) {
+      total += spherical_distance(first + offset, second + offset, size);
+    } else if (metric[group] == 2) {
+      total += categorical_distance(first + offset, second + offset, size, ncats, cat_offset);
+      cat_offset += size;
+    } else {
+      throw std::invalid_argument("Unsupported metric type in distance calculation.");
+    }
+    offset += size;
+  }
+  return total;
+}
+
+// ---------------------------------------------------------------------------
+// Assignment cache + incremental reassignment
+// ---------------------------------------------------------------------------
+
+enum class AssignmentDelta {
+  CentreAdded,
+  CentreRemoved,
+  CentreMoved,
+  FullRecompute
+};
+
+struct AssignmentCache {
+  std::vector<int> assignment;    // 0-based centre index per observation
+  std::vector<double> best_keys;  // winning comparison key per observation
+};
+
+// Row-major centres: centres[c * d + di]
+static inline double euclidean_key_active(const double* active,
+                                         const double* centres,
+                                         int /*nC*/,
+                                         int c,
+                                         int d) {
+  double key = 0.0;
+  const double* centre_row = centres + static_cast<size_t>(c) * static_cast<size_t>(d);
+  for (int di = 0; di < d; ++di) {
+    const double diff = active[di] - centre_row[di];
+    key += diff * diff;
+  }
+  return key;
+}
+
+static void assign_full_euclidean(const double* x_row,
+                                  int n,
+                                  int p,
+                                  const double* centres,
+                                  int nC,
+                                  int d,
+                                  const int* dim0,
+                                  AssignmentCache& out,
+                                  std::vector<double>& active_scratch) {
+  out.assignment.resize(n);
+  out.best_keys.resize(n);
+  active_scratch.resize(d);
   for (int obs = 0; obs < n; ++obs) {
-    for (int col = 0; col < p; ++col) {
-      query_point[col] = x[obs * p + col];
-      tess_point[col] = query_point[col];
+    const double* row = x_row + static_cast<size_t>(obs) * p;
+    for (int di = 0; di < d; ++di) {
+      active_scratch[di] = row[dim0[di]];
     }
-
-    double best_distance = std::numeric_limits<double>::infinity();
-    int best_centre = 0;
-    for (int centre = 0; centre < n_centres; ++centre) {
-      for (int local_dim = 0; local_dim < d; ++local_dim) {
-        tess_point[dim[local_dim]] = centres[centre * d + local_dim];
-      }
-      const double distance = calc_distance(query_point, tess_point, member_red, metric_red, ncats);
-      if (distance < best_distance) {
-        best_distance = distance;
-        best_centre = centre;
+    double best = std::numeric_limits<double>::infinity();
+    int best_c = 0;
+    for (int c = 0; c < nC; ++c) {
+      const double key = euclidean_key_active(active_scratch.data(), centres, nC, c, d);
+      if (key < best) {
+        best = key;
+        best_c = c;
       }
     }
-    result[obs] = best_centre;
-  }
-
-  return result;
-}
-
-void aggregate_residuals(const std::vector<double>& residuals,
-                         const std::vector<int>& idx_old,
-                         int old_centres,
-                         const std::vector<int>& idx_new,
-                         int new_centres,
-                         std::vector<double>& r_old,
-                         std::vector<int>& n_old,
-                         std::vector<double>& r_new,
-                         std::vector<int>& n_new) {
-  r_old.assign(old_centres, 0.0);
-  n_old.assign(old_centres, 0);
-  r_new.assign(new_centres, 0.0);
-  n_new.assign(new_centres, 0);
-
-  for (int obs = 0; obs < static_cast<int>(residuals.size()); ++obs) {
-    r_old[idx_old[obs]] += residuals[obs];
-    n_old[idx_old[obs]] += 1;
-    r_new[idx_new[obs]] += residuals[obs];
-    n_new[idx_new[obs]] += 1;
+    out.assignment[obs] = best_c;
+    out.best_keys[obs] = best;
   }
 }
+
+static void reassign_added_euclidean(const double* x_row,
+                                     int n,
+                                     int p,
+                                     const double* centres,
+                                     int nC,
+                                     int d,
+                                     const int* dim0,
+                                     const AssignmentCache& prev,
+                                     AssignmentCache& out,
+                                     std::vector<double>& active_scratch) {
+  out.assignment = prev.assignment;
+  out.best_keys = prev.best_keys;
+  active_scratch.resize(d);
+  const int added = nC - 1;
+  for (int obs = 0; obs < n; ++obs) {
+    const double* row = x_row + static_cast<size_t>(obs) * p;
+    for (int di = 0; di < d; ++di) {
+      active_scratch[di] = row[dim0[di]];
+    }
+    const double key = euclidean_key_active(active_scratch.data(), centres, nC, added, d);
+    if (key < out.best_keys[obs]) {
+      out.best_keys[obs] = key;
+      out.assignment[obs] = added;
+    }
+  }
+}
+
+static void reassign_moved_euclidean(const double* x_row,
+                                     int n,
+                                     int p,
+                                     const double* centres,
+                                     int nC,
+                                     int d,
+                                     const int* dim0,
+                                     int moved,
+                                     const AssignmentCache& prev,
+                                     AssignmentCache& out,
+                                     std::vector<double>& active_scratch) {
+  out.assignment = prev.assignment;
+  out.best_keys = prev.best_keys;
+  active_scratch.resize(d);
+  for (int obs = 0; obs < n; ++obs) {
+    const double* row = x_row + static_cast<size_t>(obs) * p;
+    for (int di = 0; di < d; ++di) {
+      active_scratch[di] = row[dim0[di]];
+    }
+    const int incumbent = prev.assignment[obs];
+    if (incumbent == moved) {
+      double best = std::numeric_limits<double>::infinity();
+      int best_c = 0;
+      for (int c = 0; c < nC; ++c) {
+        const double key = euclidean_key_active(active_scratch.data(), centres, nC, c, d);
+        if (key < best) {
+          best = key;
+          best_c = c;
+        }
+      }
+      out.assignment[obs] = best_c;
+      out.best_keys[obs] = best;
+    } else {
+      const double key = euclidean_key_active(active_scratch.data(), centres, nC, moved, d);
+      if (key < out.best_keys[obs] || (key == out.best_keys[obs] && moved < incumbent)) {
+        out.best_keys[obs] = key;
+        out.assignment[obs] = moved;
+      }
+    }
+  }
+}
+
+static void reassign_removed_euclidean(const double* x_row,
+                                       int n,
+                                       int p,
+                                       const double* centres,
+                                       int nC,
+                                       int d,
+                                       const int* dim0,
+                                       int removed,
+                                       const AssignmentCache& prev,
+                                       AssignmentCache& out,
+                                       std::vector<double>& active_scratch) {
+  out.assignment.resize(n);
+  out.best_keys.resize(n);
+  active_scratch.resize(d);
+  for (int obs = 0; obs < n; ++obs) {
+    const int incumbent = prev.assignment[obs];
+    if (incumbent == removed) {
+      const double* row = x_row + static_cast<size_t>(obs) * p;
+      for (int di = 0; di < d; ++di) {
+        active_scratch[di] = row[dim0[di]];
+      }
+      double best = std::numeric_limits<double>::infinity();
+      int best_c = 0;
+      for (int c = 0; c < nC; ++c) {
+        const double key = euclidean_key_active(active_scratch.data(), centres, nC, c, d);
+        if (key < best) {
+          best = key;
+          best_c = c;
+        }
+      }
+      out.assignment[obs] = best_c;
+      out.best_keys[obs] = best;
+    } else {
+      out.assignment[obs] = (incumbent > removed) ? incumbent - 1 : incumbent;
+      out.best_keys[obs] = prev.best_keys[obs];
+    }
+  }
+}
+
+static void assign_full_general(const double* x_row,
+                                int n,
+                                int p,
+                                const double* centres,
+                                int nC,
+                                int d,
+                                const int* dim0,
+                                const std::vector<int>& metric,
+                                const std::vector<int>& members,
+                                const std::vector<int>& cats,
+                                AssignmentCache& out,
+                                std::vector<double>& synth) {
+  out.assignment.resize(n);
+  out.best_keys.resize(n);
+  synth.resize(p);
+  for (int obs = 0; obs < n; ++obs) {
+    const double* row = x_row + static_cast<size_t>(obs) * p;
+    std::memcpy(synth.data(), row, static_cast<size_t>(p) * sizeof(double));
+    double best = std::numeric_limits<double>::infinity();
+    int best_c = 0;
+    for (int c = 0; c < nC; ++c) {
+      for (int di = 0; di < d; ++di) {
+        synth[dim0[di]] = centres[static_cast<size_t>(c) * d + di];
+      }
+      const double key = calc_distance(row, synth.data(), p, members, metric, cats);
+      if (key < best) {
+        best = key;
+        best_c = c;
+      }
+    }
+    out.assignment[obs] = best_c;
+    out.best_keys[obs] = best;
+  }
+}
+
+static void reassign_added_general(const double* x_row,
+                                   int n,
+                                   int p,
+                                   const double* centres,
+                                   int nC,
+                                   int d,
+                                   const int* dim0,
+                                   const std::vector<int>& metric,
+                                   const std::vector<int>& members,
+                                   const std::vector<int>& cats,
+                                   const AssignmentCache& prev,
+                                   AssignmentCache& out,
+                                   std::vector<double>& synth) {
+  out.assignment = prev.assignment;
+  out.best_keys = prev.best_keys;
+  synth.resize(p);
+  const int added = nC - 1;
+  for (int obs = 0; obs < n; ++obs) {
+    const double* row = x_row + static_cast<size_t>(obs) * p;
+    std::memcpy(synth.data(), row, static_cast<size_t>(p) * sizeof(double));
+    for (int di = 0; di < d; ++di) {
+      synth[dim0[di]] = centres[static_cast<size_t>(added) * d + di];
+    }
+    const double key = calc_distance(row, synth.data(), p, members, metric, cats);
+    if (key < out.best_keys[obs]) {
+      out.best_keys[obs] = key;
+      out.assignment[obs] = added;
+    }
+  }
+}
+
+static void reassign_moved_general(const double* x_row,
+                                   int n,
+                                   int p,
+                                   const double* centres,
+                                   int nC,
+                                   int d,
+                                   const int* dim0,
+                                   int moved,
+                                   const std::vector<int>& metric,
+                                   const std::vector<int>& members,
+                                   const std::vector<int>& cats,
+                                   const AssignmentCache& prev,
+                                   AssignmentCache& out,
+                                   std::vector<double>& synth) {
+  out.assignment = prev.assignment;
+  out.best_keys = prev.best_keys;
+  synth.resize(p);
+  for (int obs = 0; obs < n; ++obs) {
+    const double* row = x_row + static_cast<size_t>(obs) * p;
+    std::memcpy(synth.data(), row, static_cast<size_t>(p) * sizeof(double));
+    const int incumbent = prev.assignment[obs];
+    if (incumbent == moved) {
+      double best = std::numeric_limits<double>::infinity();
+      int best_c = 0;
+      for (int c = 0; c < nC; ++c) {
+        for (int di = 0; di < d; ++di) {
+          synth[dim0[di]] = centres[static_cast<size_t>(c) * d + di];
+        }
+        const double key = calc_distance(row, synth.data(), p, members, metric, cats);
+        if (key < best) {
+          best = key;
+          best_c = c;
+        }
+      }
+      out.assignment[obs] = best_c;
+      out.best_keys[obs] = best;
+    } else {
+      for (int di = 0; di < d; ++di) {
+        synth[dim0[di]] = centres[static_cast<size_t>(moved) * d + di];
+      }
+      const double key = calc_distance(row, synth.data(), p, members, metric, cats);
+      if (key < out.best_keys[obs] || (key == out.best_keys[obs] && moved < incumbent)) {
+        out.best_keys[obs] = key;
+        out.assignment[obs] = moved;
+      }
+    }
+  }
+}
+
+static void reassign_removed_general(const double* x_row,
+                                     int n,
+                                     int p,
+                                     const double* centres,
+                                     int nC,
+                                     int d,
+                                     const int* dim0,
+                                     int removed,
+                                     const std::vector<int>& metric,
+                                     const std::vector<int>& members,
+                                     const std::vector<int>& cats,
+                                     const AssignmentCache& prev,
+                                     AssignmentCache& out,
+                                     std::vector<double>& synth) {
+  out.assignment.resize(n);
+  out.best_keys.resize(n);
+  synth.resize(p);
+  for (int obs = 0; obs < n; ++obs) {
+    const int incumbent = prev.assignment[obs];
+    if (incumbent == removed) {
+      const double* row = x_row + static_cast<size_t>(obs) * p;
+      std::memcpy(synth.data(), row, static_cast<size_t>(p) * sizeof(double));
+      double best = std::numeric_limits<double>::infinity();
+      int best_c = 0;
+      for (int c = 0; c < nC; ++c) {
+        for (int di = 0; di < d; ++di) {
+          synth[dim0[di]] = centres[static_cast<size_t>(c) * d + di];
+        }
+        const double key = calc_distance(row, synth.data(), p, members, metric, cats);
+        if (key < best) {
+          best = key;
+          best_c = c;
+        }
+      }
+      out.assignment[obs] = best_c;
+      out.best_keys[obs] = best;
+    } else {
+      out.assignment[obs] = (incumbent > removed) ? incumbent - 1 : incumbent;
+      out.best_keys[obs] = prev.best_keys[obs];
+    }
+  }
+}
+
+struct AssignScratch {
+  std::vector<double> active;
+  std::vector<double> synth;
+  std::vector<int> dim0;
+};
+
+static void reassign(const double* x_row,
+                     int n,
+                     int p,
+                     const double* centres,
+                     int nC,
+                     int d,
+                     const std::vector<int>& dim,  // 0-based
+                     AssignmentDelta delta,
+                     int touched,
+                     bool euclidean,
+                     const std::vector<int>& metric,
+                     const std::vector<int>& members,
+                     const std::vector<int>& cats,
+                     const AssignmentCache& prev,
+                     AssignmentCache& out,
+                     AssignScratch& scratch) {
+  scratch.dim0.resize(d);
+  for (int i = 0; i < d; ++i) {
+    scratch.dim0[i] = dim[i];
+  }
+
+  const bool cold = prev.assignment.size() != static_cast<size_t>(n) ||
+                    prev.best_keys.size() != static_cast<size_t>(n);
+  if (cold || delta == AssignmentDelta::FullRecompute) {
+    if (euclidean) {
+      assign_full_euclidean(x_row, n, p, centres, nC, d, scratch.dim0.data(), out, scratch.active);
+    } else {
+      assign_full_general(x_row, n, p, centres, nC, d, scratch.dim0.data(), metric, members, cats,
+                          out, scratch.synth);
+    }
+    return;
+  }
+
+  if (euclidean) {
+    switch (delta) {
+      case AssignmentDelta::CentreAdded:
+        reassign_added_euclidean(x_row, n, p, centres, nC, d, scratch.dim0.data(), prev, out,
+                                 scratch.active);
+        break;
+      case AssignmentDelta::CentreMoved:
+        reassign_moved_euclidean(x_row, n, p, centres, nC, d, scratch.dim0.data(), touched, prev,
+                                 out, scratch.active);
+        break;
+      case AssignmentDelta::CentreRemoved:
+        reassign_removed_euclidean(x_row, n, p, centres, nC, d, scratch.dim0.data(), touched, prev,
+                                   out, scratch.active);
+        break;
+      case AssignmentDelta::FullRecompute:
+        assign_full_euclidean(x_row, n, p, centres, nC, d, scratch.dim0.data(), out, scratch.active);
+        break;
+    }
+  } else {
+    switch (delta) {
+      case AssignmentDelta::CentreAdded:
+        reassign_added_general(x_row, n, p, centres, nC, d, scratch.dim0.data(), metric, members,
+                               cats, prev, out, scratch.synth);
+        break;
+      case AssignmentDelta::CentreMoved:
+        reassign_moved_general(x_row, n, p, centres, nC, d, scratch.dim0.data(), touched, metric,
+                               members, cats, prev, out, scratch.synth);
+        break;
+      case AssignmentDelta::CentreRemoved:
+        reassign_removed_general(x_row, n, p, centres, nC, d, scratch.dim0.data(), touched, metric,
+                                 members, cats, prev, out, scratch.synth);
+        break;
+      case AssignmentDelta::FullRecompute:
+        assign_full_general(x_row, n, p, centres, nC, d, scratch.dim0.data(), metric, members, cats,
+                            out, scratch.synth);
+        break;
+    }
+  }
+}
+
+static void aggregate_residuals_both(const std::vector<double>& R_j,
+                                     const std::vector<int>& idx_old,
+                                     int nC_old,
+                                     const std::vector<int>& idx_new,
+                                     int nC_new,
+                                     std::vector<double>& R_old,
+                                     std::vector<int>& n_old,
+                                     std::vector<double>& R_new,
+                                     std::vector<int>& n_new) {
+  R_old.assign(nC_old, 0.0);
+  n_old.assign(nC_old, 0);
+  R_new.assign(nC_new, 0.0);
+  n_new.assign(nC_new, 0);
+  const int n = static_cast<int>(R_j.size());
+  for (int obs = 0; obs < n; ++obs) {
+    R_old[idx_old[obs]] += R_j[obs];
+    n_old[idx_old[obs]]++;
+    R_new[idx_new[obs]] += R_j[obs];
+    n_new[idx_new[obs]]++;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Progress helpers
+// ---------------------------------------------------------------------------
+
+void render_progress_bar(const std::string& label, int current, int total, int width = 30) {
+  if (total <= 0) {
+    return;
+  }
+  if (current < 0) {
+    current = 0;
+  }
+  if (current > total) {
+    current = total;
+  }
+
+  const double fraction = static_cast<double>(current) / static_cast<double>(total);
+  int filled = static_cast<int>(std::round(fraction * width));
+  if (filled > width) {
+    filled = width;
+  }
+  const int percent = static_cast<int>(std::round(fraction * 100.0));
+
+  std::ostringstream out;
+  out << '\r' << label << " [";
+  for (int idx = 0; idx < width; ++idx) {
+    out << (idx < filled ? '#' : '-');
+  }
+  out << "] " << std::setw(3) << percent << "% (" << current << "/" << total << ")";
+  if (current >= total) {
+    out << '\n';
+  }
+
+  std::cerr << out.str() << std::flush;
+}
+
+void maybe_progress(const std::string& label,
+                    int current,
+                    int total,
+                    int width,
+                    int& last_filled,
+                    bool show_progress) {
+  if (!show_progress) {
+    return;
+  }
+  int filled = 0;
+  if (total > 0) {
+    filled = static_cast<int>(static_cast<double>(current) / static_cast<double>(total) * width + 1e-12);
+    if (filled > width) {
+      filled = width;
+    }
+  }
+  if (current == 1 || current == total || filled != last_filled) {
+    render_progress_bar(label, current, total, width);
+    last_filled = filled;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MH / mu helpers (Python selection_prob formulation)
+// ---------------------------------------------------------------------------
 
 double tessellation_log_likelihood_component(const std::vector<double>& r_cell,
                                              const std::vector<int>& n_cell,
@@ -384,45 +818,62 @@ double log_acceptance_components(const std::vector<double>& r_old,
              d_new, n_centres_new, sigma_squared, omega, lambda_rate, p, modification);
 }
 
-std::vector<double> sample_mu(const std::vector<double>& r_cell,
-                              const std::vector<int>& n_cell,
-                              double sigma_squared_mu,
-                              double sigma_squared,
-                              std::mt19937_64& rng) {
-  std::vector<double> out(r_cell.size());
+static void sample_mu_into(const std::vector<double>& r_cell,
+                           const std::vector<int>& n_cell,
+                           double sigma_squared_mu,
+                           double sigma_squared,
+                           std::vector<double>& result,
+                           std::mt19937_64& rng) {
+  const int n_cells = static_cast<int>(r_cell.size());
+  result.resize(n_cells);
   std::normal_distribution<double> normal(0.0, 1.0);
-  for (int idx = 0; idx < static_cast<int>(r_cell.size()); ++idx) {
+  for (int idx = 0; idx < n_cells; ++idx) {
     const double den = sigma_squared_mu * n_cell[idx] + sigma_squared;
     const double mean = (sigma_squared_mu * r_cell[idx]) / den;
     const double sd = std::sqrt((sigma_squared * sigma_squared_mu) / den);
-    out[idx] = mean + normal(rng) * sd;
+    result[idx] = mean + normal(rng) * sd;
   }
-  return out;
 }
 
-ProposalResult propose_internal(const std::vector<double>& tess,
-                                int n_centres,
-                                int d,
-                                const std::vector<int>& dim,
-                                int p,
-                                const std::vector<double>& proposal_sd,
-                                const std::vector<double>& proposal_mu,
-                                const std::vector<int>& metric,
-                                const std::vector<int>& members,
-                                const std::vector<int>& ncats,
-                                std::mt19937_64& rng) {
+// ---------------------------------------------------------------------------
+// Tessellation proposals (with AssignmentDelta)
+// ---------------------------------------------------------------------------
+
+struct ProposalResult {
+  std::vector<double> tess;  // row-major nC x d
+  int n_centres = 0;
+  std::vector<int> dim;  // 0-based
+  std::string modification = "Change";
+  AssignmentDelta delta = AssignmentDelta::CentreMoved;
+  int touched = 0;  // moved/removed centre index (0-based)
+};
+
+static ProposalResult propose_internal(const std::vector<double>& tess,
+                                       int n_centres,
+                                       int d,
+                                       const std::vector<int>& dim,
+                                       int p,
+                                       const std::vector<double>& proposal_sd,
+                                       const std::vector<double>& proposal_mu,
+                                       const std::vector<int>& metric,
+                                       const std::vector<int>& members,
+                                       const std::vector<int>& ncats,
+                                       const std::vector<int>& cat_index_of_col,
+                                       std::mt19937_64& rng) {
   ProposalResult result;
   result.tess = tess;
   result.n_centres = n_centres;
   result.dim = dim;
   result.modification = "Change";
+  result.delta = AssignmentDelta::CentreMoved;
+  result.touched = 0;
 
   const double choice = uniform01(rng);
   std::normal_distribution<double> normal(0.0, 1.0);
 
   auto sample_global_coordinate = [&](int global_dim) {
     if (metric[global_dim] == 2) {
-      const int cat_idx = categorical_index_for_column(global_dim, metric);
+      const int cat_idx = cat_index_of_col[global_dim];
       if (cat_idx < 0 || cat_idx >= static_cast<int>(ncats.size()) || ncats[cat_idx] <= 0) {
         throw std::invalid_argument("Invalid categorical level count for proposal.");
       }
@@ -438,6 +889,7 @@ ProposalResult propose_internal(const std::vector<double>& tess,
 
   if ((choice < 0.2 && d != p) || (d == 1 && d != p && choice < 0.4)) {
     result.modification = "AD";
+    result.delta = AssignmentDelta::FullRecompute;
     int new_dim = 0;
     std::uniform_int_distribution<int> dim_dist(0, p - 1);
     do {
@@ -445,63 +897,74 @@ ProposalResult propose_internal(const std::vector<double>& tess,
     } while (in_vector(new_dim, result.dim));
 
     result.dim.push_back(new_dim);
-    result.tess.assign(n_centres * (d + 1), 0.0);
+    result.tess.assign(static_cast<size_t>(n_centres) * (d + 1), 0.0);
     for (int row = 0; row < n_centres; ++row) {
       for (int col = 0; col < d; ++col) {
-        result.tess[row * (d + 1) + col] = tess[row * d + col];
+        result.tess[static_cast<size_t>(row) * (d + 1) + col] = tess[static_cast<size_t>(row) * d + col];
       }
-      result.tess[row * (d + 1) + d] = sample_global_coordinate(new_dim);
+      result.tess[static_cast<size_t>(row) * (d + 1) + d] = sample_global_coordinate(new_dim);
     }
   } else if (choice < 0.4 && d > 1) {
     result.modification = "RD";
+    result.delta = AssignmentDelta::FullRecompute;
     std::uniform_int_distribution<int> remove_dist(0, d - 1);
     const int remove_idx = remove_dist(rng);
     result.dim.erase(result.dim.begin() + remove_idx);
-    result.tess.assign(n_centres * (d - 1), 0.0);
+    result.tess.assign(static_cast<size_t>(n_centres) * (d - 1), 0.0);
     for (int row = 0; row < n_centres; ++row) {
       int out_col = 0;
       for (int col = 0; col < d; ++col) {
         if (col == remove_idx) {
           continue;
         }
-        result.tess[row * (d - 1) + out_col] = tess[row * d + col];
+        result.tess[static_cast<size_t>(row) * (d - 1) + out_col] = tess[static_cast<size_t>(row) * d + col];
         ++out_col;
       }
     }
   } else if (choice < 0.6 || (choice < 0.8 && n_centres == 1)) {
     result.modification = "AC";
+    result.delta = AssignmentDelta::CentreAdded;
     result.n_centres = n_centres + 1;
-    result.tess.assign(result.n_centres * d, 0.0);
+    result.tess.assign(static_cast<size_t>(result.n_centres) * d, 0.0);
     for (int row = 0; row < n_centres; ++row) {
       for (int col = 0; col < d; ++col) {
-        result.tess[row * d + col] = tess[row * d + col];
+        result.tess[static_cast<size_t>(row) * d + col] = tess[static_cast<size_t>(row) * d + col];
       }
     }
     for (int col = 0; col < d; ++col) {
-      result.tess[n_centres * d + col] = sample_global_coordinate(result.dim[col]);
+      result.tess[static_cast<size_t>(n_centres) * d + col] = sample_global_coordinate(result.dim[col]);
     }
   } else if (choice < 0.8 && n_centres > 1) {
     result.modification = "RC";
+    result.delta = AssignmentDelta::CentreRemoved;
     std::uniform_int_distribution<int> remove_dist(0, n_centres - 1);
     const int remove_row = remove_dist(rng);
+    result.touched = remove_row;
     result.n_centres = n_centres - 1;
-    result.tess.reserve(result.n_centres * d);
+    // MUST clear before push_back — previously tess was copied from old then
+    // append compacted centres, so first nC*d elements were wrong.
+    result.tess.clear();
+    result.tess.reserve(static_cast<size_t>(result.n_centres) * d);
     for (int row = 0; row < n_centres; ++row) {
       if (row == remove_row) {
         continue;
       }
       for (int col = 0; col < d; ++col) {
-        result.tess.push_back(tess[row * d + col]);
+        result.tess.push_back(tess[static_cast<size_t>(row) * d + col]);
       }
     }
   } else if (choice < 0.9 || d == p) {
+    result.modification = "Change";
+    result.delta = AssignmentDelta::CentreMoved;
     std::uniform_int_distribution<int> centre_dist(0, n_centres - 1);
     const int centre = centre_dist(rng);
+    result.touched = centre;
     for (int col = 0; col < d; ++col) {
-      result.tess[centre * d + col] = sample_global_coordinate(result.dim[col]);
+      result.tess[static_cast<size_t>(centre) * d + col] = sample_global_coordinate(result.dim[col]);
     }
   } else {
     result.modification = "Swap";
+    result.delta = AssignmentDelta::FullRecompute;
     std::uniform_int_distribution<int> local_dim_dist(0, d - 1);
     std::uniform_int_distribution<int> global_dim_dist(0, p - 1);
     const int local_dim = local_dim_dist(rng);
@@ -511,15 +974,52 @@ ProposalResult propose_internal(const std::vector<double>& tess,
     } while (in_vector(new_dim, result.dim));
     result.dim[local_dim] = new_dim;
     for (int row = 0; row < n_centres; ++row) {
-      result.tess[row * d + local_dim] = sample_global_coordinate(new_dim);
+      result.tess[static_cast<size_t>(row) * d + local_dim] = sample_global_coordinate(new_dim);
     }
   }
 
   return result;
 }
 
-std::vector<double> copy_double_array(py::handle handle, int expected_ndim, std::vector<ssize_t>* shape = nullptr) {
-  py::array_t<double, py::array::c_style | py::array::forcecast> arr = py::cast<py::array_t<double>>(handle);
+// ---------------------------------------------------------------------------
+// Compact posterior store (deferred Python packaging)
+// ---------------------------------------------------------------------------
+
+struct StoredTess {
+  std::vector<double> centres;  // row-major nC x d
+  int n_centres = 0;
+  int d = 0;
+  std::vector<int> dim;  // 0-based
+  std::vector<double> mu;
+};
+
+struct StoredDraw {
+  std::vector<StoredTess> tessellations;
+  double sigma = 0.0;
+};
+
+struct FlatPosterior {
+  int num_samples = 0;
+  int m = 0;
+  std::vector<double> centres;  // concatenated row-major blocks
+  std::vector<double> mus;
+  std::vector<int> dims;  // 0-based, concatenated
+  std::vector<int> centre_off;
+  std::vector<int> mu_off;
+  std::vector<int> dim_off;
+  std::vector<int> n_centres;
+  std::vector<int> d;
+};
+
+// ---------------------------------------------------------------------------
+// Array helpers
+// ---------------------------------------------------------------------------
+
+std::vector<double> copy_double_array(py::handle handle,
+                                      int expected_ndim,
+                                      std::vector<ssize_t>* shape = nullptr) {
+  py::array_t<double, py::array::c_style | py::array::forcecast> arr =
+      py::cast<py::array_t<double>>(handle);
   py::buffer_info info = arr.request();
   if (info.ndim != expected_ndim) {
     throw std::invalid_argument("Unexpected array dimensionality.");
@@ -546,7 +1046,7 @@ py::array_t<double> make_matrix(const std::vector<double>& values, int rows, int
   auto out = arr.mutable_unchecked<2>();
   for (int row = 0; row < rows; ++row) {
     for (int col = 0; col < cols; ++col) {
-      out(row, col) = values[row * cols + col];
+      out(row, col) = values[static_cast<size_t>(row) * cols + col];
     }
   }
   return arr;
@@ -570,27 +1070,80 @@ py::array_t<int> make_int_vector(const std::vector<int>& values) {
   return arr;
 }
 
-void render_progress_bar(const std::string& label, int current, int total) {
-  if (total <= 0) {
-    return;
+FlatPosterior flatten_posterior(const py::list& posterior_tess,
+                                const py::list& posterior_dim,
+                                const py::list& posterior_pred) {
+  FlatPosterior flat;
+  flat.num_samples = static_cast<int>(posterior_tess.size());
+  if (flat.num_samples == 0) {
+    return flat;
+  }
+  if (static_cast<int>(posterior_dim.size()) != flat.num_samples ||
+      static_cast<int>(posterior_pred.size()) != flat.num_samples) {
+    throw std::invalid_argument("Posterior tess/dim/pred lists must have equal length.");
   }
 
-  constexpr int width = 30;
-  const double fraction = std::clamp(static_cast<double>(current) / static_cast<double>(total), 0.0, 1.0);
-  const int filled = static_cast<int>(std::round(fraction * width));
-  const int percent = static_cast<int>(std::round(fraction * 100.0));
+  py::list first_sample = py::cast<py::list>(posterior_tess[0]);
+  flat.m = static_cast<int>(first_sample.size());
+  const int total = flat.num_samples * flat.m;
+  flat.centre_off.resize(total);
+  flat.mu_off.resize(total);
+  flat.dim_off.resize(total);
+  flat.n_centres.resize(total);
+  flat.d.resize(total);
 
-  std::ostringstream out;
-  out << '\r' << label << " [";
-  for (int idx = 0; idx < width; ++idx) {
-    out << (idx < filled ? '#' : '-');
-  }
-  out << "] " << std::setw(3) << percent << "% (" << current << "/" << total << ")";
-  if (current >= total) {
-    out << '\n';
-  }
+  int c_off = 0;
+  int m_off = 0;
+  int d_off = 0;
+  for (int s = 0; s < flat.num_samples; ++s) {
+    py::list sample_tess = py::cast<py::list>(posterior_tess[s]);
+    py::list sample_dim = py::cast<py::list>(posterior_dim[s]);
+    py::list sample_pred = py::cast<py::list>(posterior_pred[s]);
+    if (static_cast<int>(sample_tess.size()) != flat.m ||
+        static_cast<int>(sample_dim.size()) != flat.m ||
+        static_cast<int>(sample_pred.size()) != flat.m) {
+      throw std::invalid_argument("Posterior sample has inconsistent tessellation counts.");
+    }
+    for (int j = 0; j < flat.m; ++j) {
+      const int idx = s * flat.m + j;
+      std::vector<ssize_t> tess_shape;
+      std::vector<double> centres = copy_double_array(sample_tess[j], 2, &tess_shape);
+      const int nC = static_cast<int>(tess_shape[0]);
+      const int d = static_cast<int>(tess_shape[1]);
+      std::vector<int> dims = copy_int_array(sample_dim[j]);
+      std::vector<double> mus = copy_double_array(sample_pred[j], 1);
+      if (static_cast<int>(dims.size()) != d) {
+        throw std::invalid_argument("Tessellation has mismatched dim length.");
+      }
+      if (static_cast<int>(mus.size()) != nC) {
+        throw std::invalid_argument("Tessellation has mismatched pred length.");
+      }
 
-  std::cerr << out.str() << std::flush;
+      flat.n_centres[idx] = nC;
+      flat.d[idx] = d;
+      flat.centre_off[idx] = c_off;
+      flat.mu_off[idx] = m_off;
+      flat.dim_off[idx] = d_off;
+
+      flat.centres.resize(c_off + nC * d);
+      if (nC * d > 0) {
+        std::memcpy(flat.centres.data() + c_off, centres.data(),
+                    static_cast<size_t>(nC) * d * sizeof(double));
+      }
+      flat.mus.resize(m_off + nC);
+      if (nC > 0) {
+        std::memcpy(flat.mus.data() + m_off, mus.data(), static_cast<size_t>(nC) * sizeof(double));
+      }
+      flat.dims.resize(d_off + d);
+      if (d > 0) {
+        std::memcpy(flat.dims.data() + d_off, dims.data(), static_cast<size_t>(d) * sizeof(int));
+      }
+      c_off += nC * d;
+      m_off += nC;
+      d_off += d;
+    }
+  }
+  return flat;
 }
 
 }  // namespace
@@ -647,6 +1200,25 @@ py::dict run_mcmc(py::array_t<double, py::array::c_style | py::array::forcecast>
     throw std::invalid_argument("Initial state lists must have length n_tessellations.");
   }
 
+  std::vector<char> is_binary(p, 0);
+  for (int col : binary_cols) {
+    if (col >= 0 && col < p) {
+      is_binary[col] = 1;
+    }
+  }
+
+  std::vector<int> cat_index_of_col(p, -1);
+  {
+    int cat_i = 0;
+    for (int col = 0; col < p; ++col) {
+      if (metric[col] == 2) {
+        cat_index_of_col[col] = cat_i++;
+      }
+    }
+  }
+
+  const bool euclidean = all_euclidean_metric(reduced.metric);
+
   std::vector<std::vector<double>> tess(m);
   std::vector<int> tess_n_centres(m);
   std::vector<int> tess_dim_count(m);
@@ -667,31 +1239,27 @@ py::dict run_mcmc(py::array_t<double, py::array::c_style | py::array::forcecast>
   }
 
   std::mt19937_64 rng(seed);
-  std::vector<std::vector<int>> current_indices(m);
+
+  std::vector<AssignmentCache> caches(m);
+  AssignScratch assign_scratch;
+  AssignmentCache prop_cache;
+  for (int j = 0; j < m; ++j) {
+    reassign(x_scaled, n, p, tess[j].data(), tess_n_centres[j], tess_dim_count[j], dim[j],
+             AssignmentDelta::FullRecompute, 0, euclidean, reduced.metric, reduced.member_counts,
+             ncats, AssignmentCache{}, caches[j], assign_scratch);
+  }
+
   std::vector<double> sum_all_tess(n, 0.0);
-  for (int idx = 0; idx < m; ++idx) {
-    current_indices[idx] = knn1_internal(
-        x_scaled,
-        n,
-        p,
-        tess[idx],
-        tess_n_centres[idx],
-        tess_dim_count[idx],
-        dim[idx],
-        reduced.metric,
-        reduced.member_counts,
-        ncats);
+  for (int j = 0; j < m; ++j) {
     for (int obs = 0; obs < n; ++obs) {
-      sum_all_tess[obs] += pred[idx][current_indices[idx][obs]];
+      sum_all_tess[obs] += pred[j][caches[j].assignment[obs]];
     }
   }
 
   const int num_samples = total_iter > burn_in ? (total_iter - burn_in) / thinning : 0;
-  py::list posterior_tess;
-  py::list posterior_dim;
-  py::list posterior_pred;
-  std::vector<double> posterior_sigma(num_samples);
-  std::vector<double> prediction_matrix(n * num_samples, 0.0);
+  std::vector<StoredDraw> stored;
+  stored.reserve(num_samples);
+  std::vector<double> prediction_matrix(static_cast<size_t>(n) * num_samples, 0.0);
   std::vector<int> trace_iteration(total_iter);
   std::vector<uint8_t> trace_is_burn_in(total_iter);
   std::vector<double> trace_avg_centres(total_iter);
@@ -699,15 +1267,21 @@ py::dict run_mcmc(py::array_t<double, py::array::c_style | py::array::forcecast>
   std::vector<double> trace_avg_dims(total_iter);
   std::vector<double> trace_log_likelihood(total_iter);
 
-  double sigma_squared = 1.0;
+  std::vector<double> residuals(n);
   std::vector<double> last_tess_pred(n, 0.0);
+  std::vector<double> r_old;
+  std::vector<double> r_new;
+  std::vector<int> n_old;
+  std::vector<int> n_new;
+
+  double sigma_squared = 1.0;
   int storage_idx = 0;
-  const int progress_step = std::max(1, total_iter / 100);
-  if (verbose) {
-    render_progress_bar("MCMC fit", 0, total_iter);
-  }
+  constexpr int progress_width = 30;
+  int last_filled = -1;
 
   for (int iter = 1; iter <= total_iter; ++iter) {
+    maybe_progress("MCMC fit", iter, total_iter, progress_width, last_filled, verbose);
+
     double sum_sq = 0.0;
     for (int obs = 0; obs < n; ++obs) {
       const double residual = y_scaled[obs] - sum_all_tess[obs];
@@ -721,105 +1295,82 @@ py::dict run_mcmc(py::array_t<double, py::array::c_style | py::array::forcecast>
     for (int j = 0; j < m; ++j) {
       if (j == 0) {
         for (int obs = 0; obs < n; ++obs) {
-          sum_all_tess[obs] -= pred[j][current_indices[j][obs]];
+          sum_all_tess[obs] -= pred[j][caches[j].assignment[obs]];
         }
       } else {
         for (int obs = 0; obs < n; ++obs) {
-          sum_all_tess[obs] += last_tess_pred[obs] - pred[j][current_indices[j][obs]];
+          sum_all_tess[obs] += last_tess_pred[obs] - pred[j][caches[j].assignment[obs]];
         }
       }
 
-      std::vector<double> residuals(n);
       for (int obs = 0; obs < n; ++obs) {
         residuals[obs] = y_scaled[obs] - sum_all_tess[obs];
       }
 
-      ProposalResult proposal = propose_internal(
-          tess[j],
-          tess_n_centres[j],
-          tess_dim_count[j],
-          dim[j],
-          p,
-          proposal_sd,
-          proposal_mu,
-          metric,
-          members,
-          ncats,
-          rng);
+      ProposalResult proposal = propose_internal(tess[j],
+                                                 tess_n_centres[j],
+                                                 tess_dim_count[j],
+                                                 dim[j],
+                                                 p,
+                                                 proposal_sd,
+                                                 proposal_mu,
+                                                 metric,
+                                                 members,
+                                                 ncats,
+                                                 cat_index_of_col,
+                                                 rng);
 
-      if (!binary_cols.empty()) {
-        for (int local_dim = 0; local_dim < static_cast<int>(proposal.dim.size()); ++local_dim) {
-          if (!in_vector(proposal.dim[local_dim], binary_cols)) {
-            continue;
-          }
-          const int d_new = static_cast<int>(proposal.dim.size());
+      const int d_star = static_cast<int>(proposal.dim.size());
+      for (int local_dim = 0; local_dim < d_star; ++local_dim) {
+        const int g0 = proposal.dim[local_dim];
+        if (g0 >= 0 && g0 < p && is_binary[g0]) {
           for (int row = 0; row < proposal.n_centres; ++row) {
-            double& value = proposal.tess[row * d_new + local_dim];
+            double& value = proposal.tess[static_cast<size_t>(row) * d_star + local_dim];
             value = std::clamp(value, 0.0, cat_scaling);
           }
         }
       }
 
-      std::vector<int> proposed_indices = knn1_internal(
-          x_scaled,
-          n,
-          p,
-          proposal.tess,
-          proposal.n_centres,
-          static_cast<int>(proposal.dim.size()),
-          proposal.dim,
-          reduced.metric,
-          reduced.member_counts,
-          ncats);
+      reassign(x_scaled, n, p, proposal.tess.data(), proposal.n_centres, d_star, proposal.dim,
+               proposal.delta, proposal.touched, euclidean, reduced.metric, reduced.member_counts,
+               ncats, caches[j], prop_cache, assign_scratch);
 
-      std::vector<double> r_old;
-      std::vector<double> r_new;
-      std::vector<int> n_old;
-      std::vector<int> n_new;
-      aggregate_residuals(
-          residuals,
-          current_indices[j],
-          tess_n_centres[j],
-          proposed_indices,
-          proposal.n_centres,
-          r_old,
-          n_old,
-          r_new,
-          n_new);
+      aggregate_residuals_both(residuals, caches[j].assignment, tess_n_centres[j],
+                               prop_cache.assignment, proposal.n_centres, r_old, n_old, r_new, n_new);
 
-      const bool has_empty = std::any_of(n_new.begin(), n_new.end(), [](int value) { return value == 0; });
+      const bool has_empty =
+          std::any_of(n_new.begin(), n_new.end(), [](int value) { return value == 0; });
       bool accepted = false;
       if (!has_empty) {
-        const double log_alpha = log_acceptance_components(
-            r_old,
-            n_old,
-            r_new,
-            n_new,
-            static_cast<int>(proposal.dim.size()),
-            proposal.n_centres,
-            sigma_squared,
-            sigma_squared_mu,
-            omega,
-            lambda_rate,
-            p,
-            proposal.modification);
+        const double log_alpha = log_acceptance_components(r_old,
+                                                           n_old,
+                                                           r_new,
+                                                           n_new,
+                                                           d_star,
+                                                           proposal.n_centres,
+                                                           sigma_squared,
+                                                           sigma_squared_mu,
+                                                           omega,
+                                                           lambda_rate,
+                                                           p,
+                                                           proposal.modification);
         accepted = std::log(uniform01(rng)) < log_alpha;
       }
 
       if (accepted) {
         tess[j] = std::move(proposal.tess);
         tess_n_centres[j] = proposal.n_centres;
-        tess_dim_count[j] = static_cast<int>(proposal.dim.size());
+        tess_dim_count[j] = d_star;
         dim[j] = std::move(proposal.dim);
-        current_indices[j] = std::move(proposed_indices);
-        pred[j] = sample_mu(r_new, n_new, sigma_squared_mu, sigma_squared, rng);
+        caches[j] = std::move(prop_cache);
+        sample_mu_into(r_new, n_new, sigma_squared_mu, sigma_squared, pred[j], rng);
         for (int obs = 0; obs < n; ++obs) {
-          last_tess_pred[obs] = pred[j][current_indices[j][obs]];
+          last_tess_pred[obs] = pred[j][caches[j].assignment[obs]];
         }
       } else {
-        pred[j] = sample_mu(r_old, n_old, sigma_squared_mu, sigma_squared, rng);
+        sample_mu_into(r_old, n_old, sigma_squared_mu, sigma_squared, pred[j], rng);
         for (int obs = 0; obs < n; ++obs) {
-          last_tess_pred[obs] = pred[j][current_indices[j][obs]];
+          last_tess_pred[obs] = pred[j][caches[j].assignment[obs]];
         }
       }
 
@@ -837,17 +1388,17 @@ py::dict run_mcmc(py::array_t<double, py::array::c_style | py::array::forcecast>
       mean_centres += tess_n_centres[j];
       mean_dims += tess_dim_count[j];
 
-      std::vector<double> r_retained(tess_n_centres[j], 0.0);
-      std::vector<int> n_retained(tess_n_centres[j], 0);
+      r_old.assign(tess_n_centres[j], 0.0);
+      n_old.assign(tess_n_centres[j], 0);
       for (int obs = 0; obs < n; ++obs) {
-        const int cell = current_indices[j][obs];
+        const int cell = caches[j].assignment[obs];
         const double tess_contribution = pred[j][cell];
         const double partial_residual = y_scaled[obs] - (sum_all_tess[obs] - tess_contribution);
-        r_retained[cell] += partial_residual;
-        n_retained[cell] += 1;
+        r_old[cell] += partial_residual;
+        n_old[cell] += 1;
       }
-      retained_log_lik_sum += tessellation_log_likelihood_component(
-          r_retained, n_retained, sigma_squared, sigma_squared_mu);
+      retained_log_lik_sum +=
+          tessellation_log_likelihood_component(r_old, n_old, sigma_squared, sigma_squared_mu);
     }
     mean_centres /= static_cast<double>(m);
     mean_dims /= static_cast<double>(m);
@@ -871,34 +1422,50 @@ py::dict run_mcmc(py::array_t<double, py::array::c_style | py::array::forcecast>
 
     if (iter > burn_in && (iter - burn_in) % thinning == 0) {
       for (int obs = 0; obs < n; ++obs) {
-        prediction_matrix[obs * num_samples + storage_idx] = sum_all_tess[obs];
+        prediction_matrix[static_cast<size_t>(obs) * num_samples + storage_idx] = sum_all_tess[obs];
       }
-      posterior_sigma[storage_idx] = sigma_squared;
 
-      py::list sample_tess;
-      py::list sample_dim;
-      py::list sample_pred;
+      StoredDraw draw;
+      draw.sigma = sigma_squared;
+      draw.tessellations.resize(m);
       for (int j = 0; j < m; ++j) {
-        sample_tess.append(make_matrix(tess[j], tess_n_centres[j], tess_dim_count[j]));
-        sample_dim.append(make_int_vector(dim[j]));
-        sample_pred.append(make_vector(pred[j]));
+        StoredTess& st = draw.tessellations[j];
+        st.n_centres = tess_n_centres[j];
+        st.d = tess_dim_count[j];
+        st.centres = tess[j];
+        st.dim = dim[j];
+        st.mu = pred[j];
       }
-      posterior_tess.append(sample_tess);
-      posterior_dim.append(sample_dim);
-      posterior_pred.append(sample_pred);
+      stored.push_back(std::move(draw));
       ++storage_idx;
     }
+  }
 
-    if (verbose && (iter % progress_step == 0 || iter == total_iter)) {
-      render_progress_bar("MCMC fit", iter, total_iter);
+  py::list posterior_tess;
+  py::list posterior_dim;
+  py::list posterior_pred;
+  std::vector<double> posterior_sigma(num_samples);
+  for (int s = 0; s < num_samples; ++s) {
+    py::list sample_tess;
+    py::list sample_dim;
+    py::list sample_pred;
+    for (int j = 0; j < m; ++j) {
+      const StoredTess& st = stored[s].tessellations[j];
+      sample_tess.append(make_matrix(st.centres, st.n_centres, st.d));
+      sample_dim.append(make_int_vector(st.dim));
+      sample_pred.append(make_vector(st.mu));
     }
+    posterior_tess.append(sample_tess);
+    posterior_dim.append(sample_dim);
+    posterior_pred.append(sample_pred);
+    posterior_sigma[s] = stored[s].sigma;
   }
 
   py::array_t<double> pred_matrix_arr({n, num_samples});
   auto pred_matrix = pred_matrix_arr.mutable_unchecked<2>();
   for (int obs = 0; obs < n; ++obs) {
     for (int sample = 0; sample < num_samples; ++sample) {
-      pred_matrix(obs, sample) = prediction_matrix[obs * num_samples + sample];
+      pred_matrix(obs, sample) = prediction_matrix[static_cast<size_t>(obs) * num_samples + sample];
     }
   }
 
@@ -958,8 +1525,6 @@ py::array_t<int> cell_indices(py::array_t<double, py::array::c_style | py::array
 
   std::vector<int> ncats;
   if (ncats_obj.is_none()) {
-    // Expand reduced metric to per-column codes so category counts can be derived
-    // from the query matrix when the caller does not pass them explicitly.
     std::vector<int> metric_full;
     metric_full.reserve(p);
     for (int group = 0; group < static_cast<int>(metric_red.size()); ++group) {
@@ -980,19 +1545,133 @@ py::array_t<int> cell_indices(py::array_t<double, py::array::c_style | py::array
     throw std::invalid_argument("ncats length must match the number of categorical columns.");
   }
 
-  const std::vector<int> indices =
-      knn1_internal(query, n, p, centres, n_centres, d, dim, metric_red, member_red, ncats);
-  return make_int_vector(indices);
+  const bool euclidean = all_euclidean_metric(metric_red);
+  AssignmentCache cache;
+  AssignScratch scratch;
+  reassign(query, n, p, centres.data(), n_centres, d, dim, AssignmentDelta::FullRecompute, 0,
+           euclidean, metric_red, member_red, ncats, AssignmentCache{}, cache, scratch);
+  return make_int_vector(cache.assignment);
+}
+
+py::array_t<double> predict_ensemble(
+    py::array_t<double, py::array::c_style | py::array::forcecast> x_arr,
+    py::list posterior_tess,
+    py::list posterior_dim,
+    py::list posterior_pred,
+    py::array_t<int, py::array::c_style | py::array::forcecast> metric_red_arr,
+    py::array_t<int, py::array::c_style | py::array::forcecast> member_red_arr,
+    py::object ncats_obj,
+    bool verbose) {
+  py::buffer_info x_info = x_arr.request();
+  if (x_info.ndim != 2) {
+    throw std::invalid_argument("x must be a two-dimensional array.");
+  }
+  const int n = static_cast<int>(x_info.shape[0]);
+  const int p = static_cast<int>(x_info.shape[1]);
+  const auto* x_row = static_cast<const double*>(x_info.ptr);
+
+  FlatPosterior flat = flatten_posterior(posterior_tess, posterior_dim, posterior_pred);
+  const int num_samples = flat.num_samples;
+  if (num_samples == 0) {
+    return py::array_t<double>({n, 0});
+  }
+  const int m = flat.m;
+
+  std::vector<int> metric_red = copy_int_array(metric_red_arr);
+  std::vector<int> member_red = copy_int_array(member_red_arr);
+  const int member_total = std::accumulate(member_red.begin(), member_red.end(), 0);
+  if (member_total != p) {
+    throw std::invalid_argument("member_red must sum to x column count.");
+  }
+
+  std::vector<int> ncats;
+  if (ncats_obj.is_none()) {
+    std::vector<int> metric_full;
+    metric_full.reserve(p);
+    for (int group = 0; group < static_cast<int>(metric_red.size()); ++group) {
+      metric_full.insert(metric_full.end(), member_red[group], metric_red[group]);
+    }
+    ncats = compute_ncats_from_data(x_row, n, p, metric_full);
+  } else {
+    ncats = copy_int_array(ncats_obj);
+  }
+
+  int expected_cats = 0;
+  for (int group = 0; group < static_cast<int>(metric_red.size()); ++group) {
+    if (metric_red[group] == 2) {
+      expected_cats += member_red[group];
+    }
+  }
+  if (static_cast<int>(ncats.size()) != expected_cats) {
+    throw std::invalid_argument("ncats length must match the number of categorical columns.");
+  }
+
+  const bool euclidean = all_euclidean_metric(metric_red);
+  py::array_t<double> out({n, num_samples});
+  auto out_view = out.mutable_unchecked<2>();
+
+  AssignScratch assign_scratch;
+  AssignmentCache cache;
+  std::vector<double> draw_pred(n, 0.0);
+  std::vector<int> dim0;
+
+  constexpr int progress_width = 30;
+  int last_filled = -1;
+
+  for (int s = 0; s < num_samples; ++s) {
+    maybe_progress("Predict", s + 1, num_samples, progress_width, last_filled, verbose);
+    std::fill(draw_pred.begin(), draw_pred.end(), 0.0);
+
+    for (int j = 0; j < m; ++j) {
+      const int idx = s * m + j;
+      const int nC = flat.n_centres[idx];
+      const int d = flat.d[idx];
+      const double* centres = flat.centres.data() + flat.centre_off[idx];
+      const double* mu = flat.mus.data() + flat.mu_off[idx];
+      dim0.assign(flat.dims.begin() + flat.dim_off[idx], flat.dims.begin() + flat.dim_off[idx] + d);
+
+      reassign(x_row, n, p, centres, nC, d, dim0, AssignmentDelta::FullRecompute, 0, euclidean,
+               metric_red, member_red, ncats, AssignmentCache{}, cache, assign_scratch);
+
+      for (int obs = 0; obs < n; ++obs) {
+        draw_pred[obs] += mu[cache.assignment[obs]];
+      }
+    }
+
+    for (int obs = 0; obs < n; ++obs) {
+      out_view(obs, s) = draw_pred[obs];
+    }
+  }
+
+  return out;
 }
 
 PYBIND11_MODULE(_core, m) {
   m.doc() = "Standalone C++ backend for the AddiVortes Python package.";
-  m.def("run_mcmc", &run_mcmc, py::arg("x_scaled"), py::arg("y_scaled"), py::arg("metric"),
-        py::arg("members"), py::arg("n_tessellations"), py::arg("total_iter"), py::arg("burn_in"),
-        py::arg("thinning"), py::arg("nu"), py::arg("lambda_value"), py::arg("sigma_squared_mu"),
-        py::arg("omega"), py::arg("lambda_rate"), py::arg("proposal_sd"), py::arg("proposal_mu"),
-        py::arg("init_tess"), py::arg("init_dim"), py::arg("init_pred"), py::arg("binary_cols"),
-        py::arg("cat_scaling"), py::arg("seed"), py::arg("verbose"));
+  m.def("run_mcmc",
+        &run_mcmc,
+        py::arg("x_scaled"),
+        py::arg("y_scaled"),
+        py::arg("metric"),
+        py::arg("members"),
+        py::arg("n_tessellations"),
+        py::arg("total_iter"),
+        py::arg("burn_in"),
+        py::arg("thinning"),
+        py::arg("nu"),
+        py::arg("lambda_value"),
+        py::arg("sigma_squared_mu"),
+        py::arg("omega"),
+        py::arg("lambda_rate"),
+        py::arg("proposal_sd"),
+        py::arg("proposal_mu"),
+        py::arg("init_tess"),
+        py::arg("init_dim"),
+        py::arg("init_pred"),
+        py::arg("binary_cols"),
+        py::arg("cat_scaling"),
+        py::arg("seed"),
+        py::arg("verbose"));
   m.def("cell_indices",
         &cell_indices,
         py::arg("query"),
@@ -1001,14 +1680,23 @@ PYBIND11_MODULE(_core, m) {
         py::arg("metric_red"),
         py::arg("member_red"),
         py::arg("ncats") = py::none());
-  m.def(
-      "log_acceptance_structure",
-      &log_structure_and_selection,
-      py::arg("d_new"),
-      py::arg("n_centres_new"),
-      py::arg("sigma_squared"),
-      py::arg("omega"),
-      py::arg("lambda_rate"),
-      py::arg("p"),
-      py::arg("modification"));
+  m.def("predict_ensemble",
+        &predict_ensemble,
+        py::arg("x"),
+        py::arg("posterior_tess"),
+        py::arg("posterior_dim"),
+        py::arg("posterior_pred"),
+        py::arg("metric_red"),
+        py::arg("member_red"),
+        py::arg("ncats") = py::none(),
+        py::arg("verbose") = false);
+  m.def("log_acceptance_structure",
+        &log_structure_and_selection,
+        py::arg("d_new"),
+        py::arg("n_centres_new"),
+        py::arg("sigma_squared"),
+        py::arg("omega"),
+        py::arg("lambda_rate"),
+        py::arg("p"),
+        py::arg("modification"));
 }

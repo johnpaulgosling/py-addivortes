@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.1
+
+- Aligned C++ fit/predict hot paths with R AddiVortes 0.7.1:
+  - incremental cell reassignment with cached winning distance keys;
+  - active-dimension-only Euclidean nearest-centre search, with a specialised
+    all-Euclidean fast path;
+  - preallocated MCMC scratch buffers and deferred posterior packaging;
+  - flattened posterior traversal in `predict_ensemble()`;
+  - binary-column masks and precomputed categorical column maps.
+- `predict()` now evaluates the full posterior ensemble in a single C++ call
+  rather than looping in Python over each retained draw and tessellation.
+- Fixed remove-centre proposals so compacted centres replace the previous
+  tessellation instead of being appended after it (the old layout made
+  nearest-cell assignment read the wrong leading block).
+- `traceplots()` fourth panel now shows the retained-state log-likelihood
+  component, matching R AddiVortes ≥ 0.6.3 (sigma remains available via
+  `plot(..., which=2)` and `trace_diagnostics`).
+- Added a fixed-seed Friedman benchmark that locks in-sample and test RMSE and
+  reports fit/predict timings.
+- Regenerated the MCMC parity fixture after the remove-centre layout fix.
+
 ## 0.6.9
 
 - Added native categorical covariates via `cat_onehot=False`, using Eskin

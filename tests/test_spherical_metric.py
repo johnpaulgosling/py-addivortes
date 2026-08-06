@@ -6,7 +6,8 @@ prediction paths:
 * **In-sample** predictions are produced inside the C++ ``run_mcmc`` routine,
   which reduces ``metric``/``members`` via the C++ ``make_reduced_metric``.
 * **Out-of-sample** predictions go through the :meth:`AddiVortesRegressor.predict`
-  class method, which calls ``_core.cell_indices`` with the reduced metric and
+  class method, which calls ``_core.predict_ensemble`` (sharing the same nearest-
+  centre kernel as ``_core.cell_indices``) with the reduced metric and
   member arrays computed in Python by
   :func:`addivortes.preprocessing.reduced_metric_and_members`.
 
