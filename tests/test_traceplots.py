@@ -73,9 +73,8 @@ def test_traceplots_draws_four_diagnostics(fake_pyplot, monkeypatch):
     set_calls = [call for call in axes[0].calls if call[0] == "set"]
     assert set_calls[-1][2]["title"] == "MCMC Trace: Average Centres"
     set_calls = [call for call in axes[3].calls if call[0] == "set"]
-    assert set_calls[-1][2]["title"] == "MCMC Trace: Sigma"
-    sigma_values = np.sqrt(model.posterior_.sigma)
-    assert np.allclose(axes[3].calls[0][1][1], sigma_values)
+    assert set_calls[-1][2]["title"] == "MCMC Trace: Log Likelihood"
+    assert np.allclose(axes[3].calls[0][1][1], model.trace_stats_.log_likelihood)
 
 
 def test_traceplots_requires_fitted_model(fake_pyplot):
